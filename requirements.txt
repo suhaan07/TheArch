@@ -1,0 +1,32 @@
+# TheArch — requirements
+# Install with: pip install -r requirements.txt
+
+# PDF processing
+pymupdf
+
+# OCR
+python-doctr
+
+# Embeddings
+sentence-transformers
+
+# Vector store
+chromadb
+
+# Chunking
+llama-index-core
+
+# Keyword search
+rank_bm25
+
+# Gemini API
+google-genai
+
+# UI
+streamlit
+
+# Image processing (doctr + Gemini Vision dependency)
+Pillow
+
+# Numerical
+numpy
