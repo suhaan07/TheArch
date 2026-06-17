@@ -179,7 +179,7 @@ def _extract_gemini_pdf(path: Path, gemini_client) -> str:
         for attempt in range(3):
             try:
                 resp = gemini_client.models.generate_content(
-                    model="gemini-2.0-flash",
+                    model="gemini-2.5-flash",
                     contents=[{"parts": [
                         {"inline_data": {"mime_type": "image/png", "data": _page_to_b64(img)}},
                         {"text": OCR_PROMPT},
@@ -203,7 +203,7 @@ def _extract_gemini_image(path: Path, gemini_client) -> str:
     for attempt in range(3):
         try:
             resp = gemini_client.models.generate_content(
-                model="gemini-2.0-flash",
+                model="gemini-2.5-flash",
                 contents=[{"parts": [
                     {"inline_data": {"mime_type": "image/png", "data": _page_to_b64(img)}},
                     {"text": OCR_PROMPT},
@@ -472,7 +472,7 @@ def _llm_chunk_handwritten(text: str, gemini_client) -> list[tuple[str, str]]:
     )
     try:
         resp = gemini_client.models.generate_content(
-            model="gemini-2.0-flash",
+            model="gemini-2.5-flash",
             contents=[{"parts": [{"text": prompt}]}],
         )
         raw          = resp.text.strip()
