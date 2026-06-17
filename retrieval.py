@@ -406,7 +406,6 @@ def _gemini_generate(gemini_client, prompt: str) -> str:
                 break   # permanent error or out of retries
     raise last_err
 
-
 # ── RAG query (public API) ─────────────────────────────────────────────────────
 
 def rag_query(
@@ -419,26 +418,23 @@ def rag_query(
 ) -> dict:
     """
     Full RAG pipeline:
-      1. Normalise query (typo fix + abbrev expansion)
-      2. Hybrid retrieve (vector + BM25 → RRF) — fetches RERANK_CANDIDATES
-      3. Cross-encoder rerank → trim to top_k  (skipped if reranker not loaded)
-      4. Assemble context → Gemini 2.5 Flash generation
-
-    Args:
-        patient_id:           patient scope
-        question:             natural-language question from the user
-        models:               dict returned by ingestion.init(), extended by init_reranker()
-        top_k:                final chunks fed to Gemini (default 5)
-        semantic_type_filter: narrow to one semantic category (optional)
-        doc_type_filter:      narrow to one document type (optional)
+      1. Normalise query
+      2. Hybrid retrieve
+      3. Rerank
+      4. Generate answer
+      5. Verify answer
+      6. Calculate confidence
 
     Returns:
         {
-            "answer":       str,
-            "sources":      list[dict],  # chunks with text + meta + rrf_score [+ rerank_score]
-            "context":      str,
-            "chunk_count":  int,
-            "norm_query":   str,         # normalised query (for debugging)
+            "answer": str,
+            "sources": list,
+            "context": str,
+            "chunk_count": int,
+            "norm_query": str,
+            "confidence": float,
+            "verified": bool,
+            "prompt": str
         }
     """
     norm_question = _normalize_query(question)
@@ -447,7 +443,9 @@ def rag_query(
     candidates_k = RERANK_CANDIDATES if "reranker" in models else top_k
 
     chunks = hybrid_search(
-        patient_id, norm_question, models,
+        patient_id,
+        norm_question,
+        models,
         top_k=candidates_k,
         semantic_type_filter=semantic_type_filter,
         doc_type_filter=doc_type_filter,
@@ -455,37 +453,118 @@ def rag_query(
 
     if not chunks:
         return {
-            "answer":      "No records found for this patient. Upload documents first.",
-            "sources":     [],
-            "context":     "",
+            "answer": "No records found for this patient. Upload documents first.",
+            "sources": [],
+            "context": "",
             "chunk_count": 0,
-            "norm_query":  norm_question,
+            "norm_query": norm_question,
+            "confidence": 0,
+            "verified": False,
+            "prompt": "",
         }
 
-    # Rerank → trim
+    # ----------------------------
+    # Rerank
+    # ----------------------------
     if "reranker" in models:
         chunks = _rerank(norm_question, chunks, models)
+
     chunks = chunks[:top_k]
+
+    # ----------------------------
+    # Confidence Score
+    # ----------------------------
+    confidence = 0.0
+
+    rerank_scores = [
+        chunk.get("rerank_score")
+        for chunk in chunks
+        if "rerank_score" in chunk
+    ]
+
+    if rerank_scores:
+        avg_score = sum(rerank_scores) / len(rerank_scores)
+
+        # Scale score into 0-100 range
+        confidence = round(
+            max(
+                0,
+                min(
+                    100,
+                    ((avg_score + 5) / 10) * 100
+                )
+            ),
+            1
+        )
 
     context = _build_context(chunks)
 
-    # Use the original user question in the prompt (not the normalised version)
     prompt = (
         f"{SYSTEM_PROMPT}\n\n"
         f"Patient records context:\n\n{context}\n\n"
         f"Question: {question}"
     )
 
+    # ----------------------------
+    # Main Generation
+    # ----------------------------
     try:
-        answer = _gemini_generate(models["gemini"], prompt)
+        answer = _gemini_generate(
+            models["gemini"],
+            prompt
+        )
     except Exception as e:
         answer = f"[Gemini error — {e}]"
 
+    # ----------------------------
+    # Verification Agent
+    # ----------------------------
+    verified = False
+
+    try:
+        verification_prompt = f"""
+You are a medical record verification system.
+
+Context:
+{context}
+
+Generated Answer:
+{answer}
+
+Determine whether EVERY factual claim in the generated answer is supported by the provided context.
+
+Reply with ONLY one word:
+
+SUPPORTED
+
+or
+
+NOT SUPPORTED
+"""
+
+        verification_result = _gemini_generate(
+            models["gemini"],
+            verification_prompt
+        )
+
+        verified = (
+            "SUPPORTED"
+            in verification_result.upper()
+            and
+            "NOT SUPPORTED"
+            not in verification_result.upper()
+        )
+
+    except Exception:
+        verified = False
+
     return {
-        "answer":      answer,
-        "sources":     chunks,
-        "context":     context,
+        "answer": answer,
+        "sources": chunks,
+        "context": context,
         "chunk_count": len(chunks),
-        "norm_query":  norm_question,
-        "prompt":      prompt,          # full prompt sent to Gemini
+        "norm_query": norm_question,
+        "confidence": confidence,
+        "verified": verified,
+        "prompt": prompt,
     }
