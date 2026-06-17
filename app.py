@@ -366,9 +366,30 @@ with tab_query:
             )
 
         # ── Answer ────────────────────────────────────────────────────────────
-        st.markdown("---")
-        st.markdown(result["answer"])
-        st.markdown("---")
+        # ── Answer ────────────────────────────────────────────────────────────
+st.markdown("---")
+
+st.markdown("## 🩺 Clinical Answer")
+st.markdown(result["answer"])
+
+col1, col2 = st.columns(2)
+
+with col1:
+    confidence = result.get("confidence", 0)
+    st.metric(
+        label="Confidence Score",
+        value=f"{confidence}%"
+    )
+
+with col2:
+    verified = result.get("verified", False)
+
+    if verified:
+        st.success("✓ Verified against retrieved records")
+    else:
+        st.warning("⚠ Verification unavailable")
+
+st.markdown("---")
 
         # ── Query trace ───────────────────────────────────────────────────────
         with st.expander("🔍 Query trace", expanded=False):
