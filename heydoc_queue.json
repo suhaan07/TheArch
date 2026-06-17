@@ -1,0 +1,46 @@
+[
+  {
+    "patient_id": "patient_002",
+    "name": "Priya Sharma",
+    "department": "Cardiology",
+    "doctor": "Dr. R. Mehta",
+    "position": 1,
+    "checked_in": "09:15",
+    "wait_minutes": 5,
+    "status": "active",
+    "token": "A001"
+  },
+  {
+    "patient_id": "patient_003",
+    "name": "Amit Verma",
+    "department": "Orthopedics",
+    "doctor": "Dr. S. Kumar",
+    "position": 2,
+    "checked_in": "09:30",
+    "wait_minutes": 20,
+    "status": "waiting",
+    "token": "B002"
+  },
+  {
+    "patient_id": "patient_004",
+    "name": "Sunita Rao",
+    "department": "General OPD",
+    "doctor": "Dr. P. Nair",
+    "position": 3,
+    "checked_in": "09:45",
+    "wait_minutes": 35,
+    "status": "waiting",
+    "token": "C003"
+  },
+  {
+    "patient_id": "patient_001",
+    "name": "Suhaan",
+    "department": "Cardiology",
+    "doctor": "Dr. R. Mehta",
+    "position": 4,
+    "checked_in": "18:43",
+    "wait_minutes": 50,
+    "status": "waiting",
+    "token": "D004"
+  }
+]
