@@ -1,0 +1,348 @@
+/* ============================================================
+   HeyDoc — Design tokens
+   ============================================================ */
+:root {
+  --teal900: #0a3d33; --teal700: #0f6e56; --teal600: #16876b; --teal500: #1d9e75;
+  --teal100: #dcf2e9; --teal50: #f1f9f6;
+  --coral600: #c4502c; --coral500: #d85a30; --coral100: #fbe4da; --coral50: #fdf2ec;
+  --ink900: #1c2420; --ink700: #3c4842; --ink500: #6b756f; --ink300: #a6ada8; --ink100: #e4e7e4;
+  --cream: #faf8f3; --white: #ffffff;
+  --amber600: #a3650e; --amber100: #fbe8cc; --amber50: #fdf4e6;
+  --blue600: #1f5fa0; --blue100: #dcebfb; --blue50: #eef6fd;
+  --purple600: #6a3fa0; --purple100: #eee4fb;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+  background: var(--cream);
+  color: var(--ink900);
+}
+
+#root {
+  min-height: 100vh;
+}
+
+button { font-family: inherit; }
+input, select { font-family: inherit; }
+
+/* ============================================================
+   Role colors / labels (used as inline custom props per element)
+   ============================================================ */
+.role-patient { --role-color: var(--teal600); }
+.role-doctor  { --role-color: var(--blue600); }
+.role-tpa     { --role-color: var(--amber600); }
+.role-lab     { --role-color: var(--purple600); }
+.role-admin   { --role-color: var(--coral600); }
+
+/* ============================================================
+   Primitives
+   ============================================================ */
+.icon { display: inline-flex; flex-shrink: 0; }
+
+.logo {
+  width: 28px; height: 28px; border-radius: 8px; background: var(--teal600);
+  display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+}
+.logo.lg { width: 48px; height: 48px; border-radius: 12px; }
+
+.badge {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 12px; font-weight: 600; padding: 3px 9px; border-radius: 999px; white-space: nowrap;
+}
+
+.card {
+  background: var(--white); border: 1px solid var(--ink100); border-radius: 14px; padding: 20px 22px;
+}
+
+.btn {
+  border: none; border-radius: 10px; padding: 10px 18px; font-size: 14px; font-weight: 600;
+  cursor: pointer; display: inline-flex; align-items: center; gap: 8px; transition: opacity .15s;
+}
+.btn:disabled { cursor: not-allowed; opacity: .5; }
+.btn-primary { background: var(--teal600); color: #fff; }
+.btn-secondary { background: var(--teal50); color: var(--teal700); border: 1px solid var(--teal100); }
+.btn-ghost { background: transparent; color: var(--ink700); border: 1px solid var(--ink100); }
+.btn-danger { background: var(--coral500); color: #fff; }
+.btn-block { width: 100%; justify-content: center; }
+
+.field { display: block; margin-bottom: 16px; }
+.field-label { font-size: 13px; font-weight: 600; color: var(--ink700); margin-bottom: 6px; }
+
+.input {
+  width: 100%; box-sizing: border-box; padding: 10px 12px; border-radius: 10px;
+  border: 1px solid var(--ink100); font-size: 14px; background: var(--cream); outline: none;
+}
+
+.empty-state { text-align: center; padding: 48px 20px; color: var(--ink500); }
+.empty-state-icon {
+  width: 48px; height: 48px; border-radius: 12px; background: var(--cream);
+  display: flex; align-items: center; justify-content: center; margin: 0 auto 14px;
+}
+.empty-state-title { font-weight: 600; color: var(--ink700); margin-bottom: 4px; }
+.empty-state-sub { font-size: 13px; }
+
+.ai-notice {
+  display: flex; gap: 10px; align-items: flex-start; background: var(--amber50);
+  border: 1px solid var(--amber100); border-radius: 10px; padding: 10px 14px;
+  font-size: 12.5px; color: var(--amber600); margin-top: 14px;
+}
+
+/* ============================================================
+   Shell / sidebar layout
+   ============================================================ */
+.shell {
+  display: flex; min-height: 100vh; width: 100%; background: var(--cream);
+}
+.sidebar {
+  width: 240px; flex-shrink: 0; background: var(--white); border-right: 1px solid var(--ink100);
+  display: flex; flex-direction: column; padding: 20px 14px;
+}
+.sidebar-close { display: none; }
+
+.mobile-topbar {
+  display: none; align-items: center; gap: 12px; padding: 14px 18px;
+  background: var(--white); border-bottom: 1px solid var(--ink100);
+}
+.hamburger-btn {
+  border: none; background: transparent; padding: 4px; cursor: pointer;
+  display: flex; align-items: center; color: var(--ink700);
+}
+.sidebar-backdrop { display: none; }
+
+/* ============================================================
+   Responsive — collapse sidebar into a slide-out drawer on mobile
+   ============================================================ */
+@media (max-width: 860px) {
+  .shell { flex-direction: column; }
+  .mobile-topbar { display: flex; }
+  .sidebar {
+    position: fixed; top: 0; left: 0; height: 100vh; width: 260px;
+    transform: translateX(-100%); transition: transform .2s ease;
+    z-index: 100; box-shadow: 2px 0 16px rgba(0,0,0,.15);
+  }
+  .sidebar.open { transform: translateX(0); }
+  .sidebar-close {
+    display: flex; align-self: flex-end; border: none; background: transparent;
+    padding: 6px; cursor: pointer; color: var(--ink500); margin-bottom: 6px;
+  }
+  .sidebar-backdrop.open {
+    display: block; position: fixed; inset: 0; background: rgba(0,0,0,.35); z-index: 90;
+  }
+  .main-content { padding: 18px 16px; }
+}
+.sidebar-brand { display: flex; align-items: center; gap: 10px; padding: 4px 8px 22px; }
+.sidebar-brand-name { font-size: 18px; font-weight: 700; color: var(--ink900); }
+
+.sidebar-user {
+  display: flex; align-items: center; gap: 10px; padding: 10px 10px; margin-bottom: 18px;
+  background: var(--cream); border-radius: 10px;
+}
+.sidebar-avatar {
+  width: 32px; height: 32px; border-radius: 50%; background: var(--role-color); color: #fff;
+  display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 700; flex-shrink: 0;
+}
+.sidebar-user-name {
+  font-size: 13px; font-weight: 600; color: var(--ink900); overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+.sidebar-user-role { font-size: 11.5px; color: var(--role-color); font-weight: 600; }
+
+.sidebar-nav { flex: 1; display: flex; flex-direction: column; gap: 2px; }
+.nav-item {
+  display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 10px;
+  border: none; background: transparent; color: var(--ink700); font-size: 14px; font-weight: 600;
+  cursor: pointer; text-align: left; width: 100%;
+}
+.nav-item .icon { color: var(--ink500); }
+.nav-item.active { background: var(--role-color); color: #fff; }
+.nav-item.active .icon { color: #fff; }
+
+.sidebar-logout {
+  display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 10px;
+  border: none; background: transparent; color: var(--ink500); font-size: 14px; font-weight: 600;
+  cursor: pointer; margin-top: 12px;
+}
+
+.main-content { flex: 1; padding: 28px 36px; overflow-y: auto; }
+
+.page-header { margin-bottom: 24px; }
+.page-header h1 { font-size: 24px; font-weight: 700; color: var(--ink900); margin: 0; }
+.page-header p { font-size: 14px; color: var(--ink500); margin: 6px 0 0; }
+
+/* ============================================================
+   Layout helpers
+   ============================================================ */
+.row { display: flex; gap: 16px; }
+.row.mb-20 { margin-bottom: 20px; }
+.row.mb-24 { margin-bottom: 24px; }
+.col { flex: 1; }
+.col-1-3 { flex: 1.3; }
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+
+/* ============================================================
+   Stat card / doc row / semantic tags
+   ============================================================ */
+.stat-card-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.stat-card-icon { width: 32px; height: 32px; border-radius: 9px; display: flex; align-items: center; justify-content: center; }
+.stat-card-label { font-size: 13px; font-weight: 600; color: var(--ink500); }
+.stat-card-value { font-size: 28px; font-weight: 700; color: var(--ink900); }
+.stat-card-sub { font-size: 12.5px; color: var(--ink500); margin-top: 2px; }
+
+.doc-row {
+  display: flex; align-items: center; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--ink100);
+}
+.doc-row:last-child { border-bottom: none; }
+.doc-row-name {
+  font-size: 13.5px; font-weight: 600; color: var(--ink900); overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+.doc-row-date { font-size: 12px; color: var(--ink500); }
+.doc-row-body { flex: 1; min-width: 0; }
+
+.section-title { font-weight: 700; font-size: 15px; margin-bottom: 4px; }
+.section-sub { font-size: 12.5px; color: var(--ink500); margin: 0 0 10px; }
+
+/* ============================================================
+   Auth screen
+   ============================================================ */
+.auth-wrap {
+  min-height: 100vh; background: var(--cream); display: flex; align-items: center;
+  justify-content: center; padding: 32px;
+}
+.auth-inner { width: 100%; max-width: 460px; }
+.auth-header { display: flex; flex-direction: column; align-items: center; margin-bottom: 28px; }
+.auth-title { font-size: 26px; font-weight: 700; color: var(--ink900); margin-top: 14px; }
+.auth-sub { font-size: 14px; color: var(--ink500); margin-top: 4px; }
+
+.auth-tabs { display: flex; gap: 4px; margin-bottom: 22px; background: var(--cream); border-radius: 10px; padding: 4px; }
+.auth-tab {
+  flex: 1; padding: 8px 0; border: none; border-radius: 8px; font-size: 14px; font-weight: 600;
+  cursor: pointer; background: transparent; color: var(--ink500);
+}
+.auth-tab.active { background: var(--white); color: var(--teal700); }
+
+.back-link {
+  background: none; border: none; color: var(--ink500); font-size: 12.5px; font-weight: 600;
+  cursor: pointer; margin-bottom: 14px; padding: 0; display: block;
+}
+
+.role-card {
+  display: flex; align-items: center; gap: 12px; padding: 14px 16px; border-radius: 12px;
+  border: 1px solid var(--ink100); background: var(--white); cursor: pointer; text-align: left; width: 100%;
+}
+.role-card-icon {
+  width: 38px; height: 38px; border-radius: 10px; background: var(--teal50);
+  display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+}
+.role-card-title { font-weight: 700; font-size: 14px; color: var(--ink900); }
+.role-card-desc { font-size: 12.5px; color: var(--ink500); }
+
+.staff-card {
+  display: flex; flex-direction: column; gap: 8px; padding: 14px; border-radius: 12px;
+  border: 1px solid var(--ink100); background: var(--white); cursor: pointer; text-align: left;
+}
+.staff-card-title { font-weight: 700; font-size: 13px; color: var(--ink900); }
+.staff-card-desc { font-size: 11.5px; color: var(--ink500); line-height: 1.4; }
+
+.auth-error {
+  background: var(--coral50); border: 1px solid var(--coral100); color: var(--coral600);
+  font-size: 12.5px; font-weight: 600; padding: 10px 12px; border-radius: 10px; margin-bottom: 14px;
+}
+
+.quick-signin-label { font-size: 12px; color: var(--ink500); text-align: center; margin: 16px 0 10px; }
+.quick-signin-row { display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; }
+.quick-signin-btn {
+  font-size: 12px; font-weight: 600; padding: 6px 10px; border-radius: 8px;
+  border: 1px solid var(--ink100); background: var(--cream); color: var(--ink700); cursor: pointer;
+}
+
+/* ============================================================
+   Upload / dropzone
+   ============================================================ */
+.dropzone {
+  text-align: center; padding: 40px 20px; border: 2px dashed var(--ink100); border-radius: 14px;
+}
+.dropzone.compact { padding: 28px 16px; border-radius: 12px; }
+.dropzone-title { font-weight: 700; font-size: 15px; color: var(--ink900); margin-top: 12px; }
+.dropzone.compact .dropzone-title { font-size: 13px; margin-top: 8px; }
+.dropzone-sub { font-size: 12.5px; color: var(--ink500); margin-top: 4px; }
+.dropzone-note {
+  margin-top: 16px; font-size: 12.5px; color: var(--teal700); background: var(--teal50);
+  padding: 8px 14px; border-radius: 8px; display: inline-block;
+}
+.dropzone-note.compact { margin-top: 14px; padding: 10px 14px; border-radius: 8px; display: block; text-align: left; }
+
+/* ============================================================
+   Ask HeyDoc (chat)
+   ============================================================ */
+.chat-card { min-height: 380px; display: flex; flex-direction: column; }
+.chat-body { flex: 1; }
+.chat-suggestions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 16px; }
+.chat-suggestion {
+  text-align: left; font-size: 12.5px; padding: 10px 12px; border-radius: 9px;
+  border: 1px solid var(--ink100); background: var(--cream); cursor: pointer; color: var(--ink700);
+}
+.chat-messages { display: flex; flex-direction: column; gap: 14px; }
+.chat-msg { max-width: 78%; }
+.chat-msg.user { align-self: flex-end; }
+.chat-msg.assistant { align-self: flex-start; }
+.chat-bubble { padding: 10px 14px; border-radius: 12px; font-size: 13.5px; line-height: 1.5; white-space: pre-wrap; }
+.chat-bubble.user { background: var(--teal600); color: #fff; }
+.chat-bubble.assistant { background: var(--cream); color: var(--ink900); }
+.chat-sources { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.chat-input-row { display: flex; gap: 10px; margin-top: 16px; border-top: 1px solid var(--ink100); padding-top: 16px; }
+
+/* ============================================================
+   Appointments / queue
+   ============================================================ */
+.appt-card-head { display: flex; justify-content: space-between; align-items: flex-start; }
+.appt-doctor { font-weight: 700; font-size: 15px; }
+.appt-meta { font-size: 13px; color: var(--ink500); }
+.preadmit { margin-top: 16px; border-top: 1px solid var(--ink100); padding-top: 14px; }
+.preadmit-title { font-size: 12.5px; font-weight: 700; color: var(--ink700); margin-bottom: 10px; }
+.preadmit-step { display: flex; align-items: center; gap: 10px; padding: 6px 0; font-size: 13px; }
+.preadmit-dot {
+  width: 18px; height: 18px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+  background: var(--ink100); flex-shrink: 0;
+}
+.preadmit-dot.done { background: var(--teal600); }
+.preadmit-note { font-size: 12px; color: var(--ink500); margin-top: 10px; }
+
+.queue-wait-box { background: var(--cream); border-radius: 10px; padding: 16px; text-align: center; }
+.queue-checked-box { background: var(--teal50); border-radius: 10px; padding: 18px; text-align: center; }
+.queue-checked-label { font-size: 13px; color: var(--teal700); font-weight: 600; }
+.queue-position { font-size: 34px; font-weight: 700; color: var(--teal700); margin: 6px 0; }
+.queue-eta { font-size: 12.5px; color: var(--ink500); }
+.queue-row { display: flex; align-items: center; gap: 14px; }
+.queue-row-num {
+  width: 30px; height: 30px; border-radius: 50%; background: var(--blue50); display: flex;
+  align-items: center; justify-content: center; font-weight: 700; font-size: 13px; color: var(--blue600); flex-shrink: 0;
+}
+
+/* ============================================================
+   Intake form
+   ============================================================ */
+.dept-status-row { display: flex; gap: 10px; }
+.dept-status-cell { flex: 1; text-align: center; padding: 10px 6px; border-radius: 10px; background: var(--cream); }
+.dept-status-label { font-size: 11.5px; color: var(--ink500); text-transform: capitalize; }
+.verify-box {
+  display: flex; align-items: center; gap: 10px; margin-top: 18px; padding: 12px 14px;
+  background: var(--coral50); border-radius: 10px;
+}
+.verify-box span { font-size: 13px; color: var(--coral600); font-weight: 600; }
+.verify-checkbox { width: 16px; height: 16px; }
+
+/* ============================================================
+   Misc
+   ============================================================ */
+.mb-10 { margin-bottom: 10px; }
+.mb-14 { margin-bottom: 14px; }
+.mb-16 { margin-bottom: 16px; }
+.mt-8 { margin-top: 8px; }
+.flex-between { display: flex; justify-content: space-between; align-items: center; }
+.flex-center-gap { display: flex; align-items: center; gap: 10px; }
+.code-inline { font-size: 11.5px; }

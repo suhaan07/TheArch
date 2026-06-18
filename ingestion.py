@@ -24,11 +24,14 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 # ── Config ────────────────────────────────────────────────────────────────────
+# THEARCH_DATA_DIR lets this run locally (FastAPI/server.py) or in Colab —
+# set it to "/content/drive/MyDrive/TheArch" in a Colab notebook to keep the
+# old persistent-to-Drive behaviour; defaults to a local folder otherwise.
 
-DRIVE_BASE  = Path("/content/drive/MyDrive/TheArch")
+DRIVE_BASE  = Path(os.environ.get("THEARCH_DATA_DIR", Path(__file__).resolve().parent / "data"))
 CHROMA_DIR  = DRIVE_BASE / "chroma_db"
 UPLOAD_DIR  = DRIVE_BASE / "uploads"
-LOCAL_BASE  = Path("/content/thearch_scratch")
+LOCAL_BASE  = DRIVE_BASE / "scratch"
 
 DIGITAL_CHAR_THRESHOLD = 50
 CHUNK_SIZE             = 384
@@ -222,6 +225,10 @@ def extract_text(path: Path, models: dict) -> tuple[str, str]:
 
       0. Plain text (.txt/.md)     → read directly
       1. Digital PDF               → PyMuPDF
+         If that text doesn't classify into any known doc_type, its embedded
+         text layer is probably unreliable (e.g. scanner software embedding
+         its own low-quality OCR pass under a clean printed letterhead) —
+         escalate to Tier 2 and keep whichever result actually classifies.
       2. Scanned PDF / image
          a. docTR conf >= 0.80     → use docTR       (printed/typed)
          b. docTR conf <  0.80     → Gemini Vision   (handwritten)
@@ -239,9 +246,14 @@ def extract_text(path: Path, models: dict) -> tuple[str, str]:
         return path.read_text(errors="replace"), "plaintext"
 
     # Tier 1
+    pymupdf_text = None
     if _is_digital_pdf(path):
         print(f"    [pymupdf]   {path.name}")
-        return _extract_pymupdf(path), "pymupdf"
+        pymupdf_text = _extract_pymupdf(path)
+        if classify_document(pymupdf_text) != "unknown":
+            return pymupdf_text, "pymupdf"
+        print(f"    [pymupdf]   text layer didn't match any known document type "
+              f"— embedded text layer looks unreliable, escalating to OCR")
 
     # Tier 2a — docTR
     print(f"    [doctr]     {path.name}")
@@ -256,25 +268,37 @@ def extract_text(path: Path, models: dict) -> tuple[str, str]:
             else _extract_gemini_pdf(path, models["gemini"])
         )
         if len(gemini_text.strip()) >= GEMINI_MIN_CHARS:
-            return gemini_text, "gemini"
-        return doctr_text, "doctr_fallback"
+            ocr_text, ocr_method = gemini_text, "gemini"
+        else:
+            ocr_text, ocr_method = doctr_text, "doctr_fallback"
 
     # docTR confident → use it
-    if doctr_conf >= DOCTR_CONF_THRESHOLD:
-        return doctr_text, "doctr"
+    elif doctr_conf >= DOCTR_CONF_THRESHOLD:
+        ocr_text, ocr_method = doctr_text, "doctr"
 
     # Tier 2b — low confidence → escalate to Gemini
-    print(f"    [gemini]    {path.name}  (conf {doctr_conf:.3f} < {DOCTR_CONF_THRESHOLD})")
-    gemini_text = (
-        _extract_gemini_image(path, models["gemini"]) if is_image
-        else _extract_gemini_pdf(path, models["gemini"])
-    )
-    if len(gemini_text.strip()) > len(doctr_text.strip()):
-        print(f"    [gemini]    won ({len(gemini_text)} > {len(doctr_text)} chars)")
-        return gemini_text, "gemini"
+    else:
+        print(f"    [gemini]    {path.name}  (conf {doctr_conf:.3f} < {DOCTR_CONF_THRESHOLD})")
+        gemini_text = (
+            _extract_gemini_image(path, models["gemini"]) if is_image
+            else _extract_gemini_pdf(path, models["gemini"])
+        )
+        if len(gemini_text.strip()) > len(doctr_text.strip()):
+            print(f"    [gemini]    won ({len(gemini_text)} > {len(doctr_text)} chars)")
+            ocr_text, ocr_method = gemini_text, "gemini"
+        else:
+            print(f"    [doctr_fb]  Gemini returned less — keeping docTR")
+            ocr_text, ocr_method = doctr_text, "doctr_fallback"
 
-    print(f"    [doctr_fb]  Gemini returned less — keeping docTR")
-    return doctr_text, "doctr_fallback"
+    if pymupdf_text is not None:
+        # We only reach here because the pymupdf text classified as unknown.
+        # Prefer OCR unless it did even worse than the embedded text layer.
+        if classify_document(ocr_text) != "unknown" or len(ocr_text.strip()) > len(pymupdf_text.strip()):
+            return ocr_text, ocr_method
+        print(f"    [pymupdf]   OCR didn't improve on the embedded text layer — keeping pymupdf")
+        return pymupdf_text, "pymupdf"
+
+    return ocr_text, ocr_method
 
 
 # ── Document Type Classifier ──────────────────────────────────────────────────

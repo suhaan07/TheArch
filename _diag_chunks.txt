@@ -1,0 +1,86 @@
+TOTAL chunks: 4
+---
+id: bf7b3d5d3f3dabd6d6afb2e38959048e
+patient_id: patient_aae3d55d | file: prescription_test.pdf | doc_type: unknown | semantic_type: patient_information | method: pymupdf | chunk_index: 0 / 2
+drugs: None | diagnosis: None | doctor: Raghav Mantri | ingested_at: 2026-06-18T13:01:03.650528
+text: [PAGE 1]
+MAX 
+bruaig donu wih 
+Director 
+Clinical Leod 
+6 Body 
+Institute of Reconstructive, Aesthetic, 
+Cleft & Craniofacial Surgery 
+Dr. Raghav Mantri 
+jushemin oinauns 
+posuction 
+16 duefynlint 
+disvang 
+pu 
+atbsias Pnuuonhnub ?rwivu 
+wtlen (boL - 16|sla) 
+Max Institute of Reconstructive, Aesthet
+---
+id: e8266953fc58c0b5c79f7e6efe872fff
+patient_id: patient_aae3d55d | file: prescription_test.pdf | doc_type: unknown | semantic_type: patient_information | method: pymupdf | chunk_index: 1 / 2
+drugs: None | diagnosis: None | doctor: Raghav Mantri | ingested_at: 2026-06-18T13:01:03.651483
+text: c o m  
+(CIN: L7220OMH2001PLC322854) 
+Appolntments #860 444 B88, 8826 237 222 
+Emergency: 011.4055 4055 
+E: sunitehoudharyomavheaithcare.com 
+Regd. Office: 401; 4th Floor, Man Exceflenza, S. V. Road, 
+Vile Parle (West), Mumbal, Maharashtra -400 056 
+T: +91-22 2610 046/62 
+DMC Reg. No: 21057 
+Jolyfon
+---
+id: 0c385f2f16c2525944a0a0cb67cb4bec
+patient_id: patient_001 | file: dischargesummary_test.pdf | doc_type: prescription | semantic_type: medication_history | method: pymupdf | chunk_index: 0 / 1
+drugs: Ceroxim-XP 625 mg | twice | bd | Pantop 40 mg | once | Supradyn | diagnosis: None | doctor: Sunil Choudhary 
+Discharge Summary | ingested_at: 2026-06-18T13:13:39.730090
+text: [PAGE 1]
+070272430 
+SN 
+N 
+Nagt 
+-Paciat Demography Detalla 
+Suhaan Aneia 
+Do 
+MAX 
+Healthcare 
+04 AUG, 2007 
+DOL tl6 MAY, 2026 08-01 
+Diages 
+Surget Name 
+Ward 
+t SKTE-STHFLR-MAs 
+uT-L MODEL TOWN VTC KARNAL RURAL PART 1, 
+Adiess Karnal, Karnal, HARYANA, 13200 
+Chief Complaint: 
+Rest Dermoid Cyst Ti
+---
+id: 91ecedfe5d4d5db0ad0d406c5eb1fc88
+patient_id: patient_aae3d55d | file: dischargesummary_test.pdf | doc_type: prescription | semantic_type: medication_history | method: pymupdf | chunk_index: 0 / 1
+drugs: Ceroxim-XP 625 mg | twice | bd | Pantop 40 mg | once | Supradyn | diagnosis: None | doctor: Sunil Choudhary 
+Discharge Summary | ingested_at: 2026-06-18T13:15:10.235324
+text: [PAGE 1]
+070272430 
+SN 
+N 
+Nagt 
+-Paciat Demography Detalla 
+Suhaan Aneia 
+Do 
+MAX 
+Healthcare 
+04 AUG, 2007 
+DOL tl6 MAY, 2026 08-01 
+Diages 
+Surget Name 
+Ward 
+t SKTE-STHFLR-MAs 
+uT-L MODEL TOWN VTC KARNAL RURAL PART 1, 
+Adiess Karnal, Karnal, HARYANA, 13200 
+Chief Complaint: 
+Rest Dermoid Cyst Ti

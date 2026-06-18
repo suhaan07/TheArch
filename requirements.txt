@@ -28,6 +28,13 @@ google-genai
 # UI
 streamlit
 
+# Auth API (server.py) backing the web/ frontend
+fastapi
+uvicorn[standard]
+email-validator
+python-multipart
+python-dotenv
+
 # Image processing (doctr + Gemini Vision + imaging pipeline)
 Pillow
 

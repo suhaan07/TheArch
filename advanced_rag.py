@@ -789,6 +789,15 @@ def advanced_rag_query(
             "verification_explanation": str,
             "confidence_reason": str,
         }``
+
+    If a structured agent (timeline/admission/medication/allergy/surgery)
+    finds nothing — e.g. because the relevant document was classified as
+    ``unknown`` at ingestion and never got its structured metadata fields
+    populated — this falls back to the general ``retrieval.rag_query`` hybrid
+    search instead of returning an empty "not found" answer. That path
+    searches raw chunk text directly, so it can still surface a document
+    the structured agents couldn't use. ``route`` reflects this as
+    ``"<agent>->rag_fallback"``.
     """
     logger.info(
         "advanced_rag_query — patient=%s  question=%r",
@@ -809,39 +818,57 @@ def advanced_rag_query(
     context:  str        = ""
     sources:  list[dict] = []
     metadata: dict       = {}
+    need_rag_fallback     = (route == "rag_agent")
 
     if route == "timeline_agent":
         agent_result = generate_patient_timeline(patient_id, collection)
         metadata     = agent_result
-        answer       = _format_timeline_answer(agent_result)
-        context      = answer   # context == formatted output for verification
+        if _agent_found_nothing(route, agent_result):
+            need_rag_fallback = True
+        else:
+            answer  = _format_timeline_answer(agent_result)
+            context = answer   # context == formatted output for verification
 
     elif route == "admission_agent":
         agent_result = generate_admission_summary(patient_id, collection)
         metadata     = agent_result
-        answer       = _format_admission_answer(agent_result)
-        context      = answer
+        if _agent_found_nothing(route, agent_result):
+            need_rag_fallback = True
+        else:
+            answer  = _format_admission_answer(agent_result)
+            context = answer
 
     elif route == "medication_agent":
         agent_result = get_medications(patient_id, collection)
         metadata     = agent_result
-        answer       = _format_medications_answer(agent_result)
-        context      = answer
+        if _agent_found_nothing(route, agent_result):
+            need_rag_fallback = True
+        else:
+            answer  = _format_medications_answer(agent_result)
+            context = answer
 
     elif route == "allergy_agent":
         agent_result = get_allergies(patient_id, collection)
         metadata     = agent_result
-        answer       = _format_allergies_answer(agent_result)
-        context      = answer
+        if _agent_found_nothing(route, agent_result):
+            need_rag_fallback = True
+        else:
+            answer  = _format_allergies_answer(agent_result)
+            context = answer
 
     elif route == "surgery_agent":
         agent_result = get_surgeries(patient_id, collection)
         metadata     = agent_result
-        answer       = _format_surgeries_answer(agent_result)
-        context      = answer
+        if _agent_found_nothing(route, agent_result):
+            need_rag_fallback = True
+        else:
+            answer  = _format_surgeries_answer(agent_result)
+            context = answer
 
-    else:
-        # Default: standard hybrid RAG pipeline from retrieval.py
+    if need_rag_fallback:
+        # Either this was already the default RAG route, or the structured
+        # agent above found nothing — fall back to hybrid search over raw
+        # chunk text, which isn't gated on doc_type/metadata extraction.
         try:
             from retrieval import rag_query
         except ImportError as exc:
@@ -851,14 +878,23 @@ def advanced_rag_query(
                 f"retrieval module not available: {exc}",
             )
 
+        if route != "rag_agent":
+            logger.info(
+                "advanced_rag_query — %s found nothing, falling back to rag_agent",
+                route,
+            )
+
         rag_result = rag_query(patient_id, question, models)
         answer     = rag_result.get("answer", "")
         context    = rag_result.get("context", "")
         sources    = rag_result.get("sources", [])
         metadata   = {
+            **metadata,
             "norm_query":  rag_result.get("norm_query", ""),
             "chunk_count": rag_result.get("chunk_count", 0),
         }
+        if route != "rag_agent":
+            route = f"{route}->rag_fallback"
 
     # ── Step 4: verification ──────────────────────────────────────────────
     verification = verify_answer(answer, context, gemini_model)
@@ -917,6 +953,18 @@ def _gemini_call(gemini_model, prompt: str) -> str:
                 break
     logger.error("[Gemini] permanent failure: %s", last_err)
     return f"[ERROR] Gemini call failed: {last_err}"
+
+
+def _agent_found_nothing(route: str, agent_result: dict) -> bool:
+    """True if a structured agent's result is empty — i.e. it has nothing
+    to answer with, so advanced_rag_query should fall back to rag_agent."""
+    if route == "timeline_agent":
+        return agent_result.get("total_events", 0) == 0
+    if route == "admission_agent":
+        return not any(agent_result.get(k) for k in ("diagnoses", "medications", "allergies", "surgeries"))
+    if route in ("medication_agent", "allergy_agent", "surgery_agent"):
+        return agent_result.get("total", 0) == 0
+    return False
 
 
 def _split_pipe(value: str) -> list[str]:
