@@ -255,10 +255,27 @@ def extract_text(path: Path, models: dict) -> tuple[str, str]:
         print(f"    [pymupdf]   text layer didn't match any known document type "
               f"— embedded text layer looks unreliable, escalating to OCR")
 
-    # Tier 2a — docTR
-    print(f"    [doctr]     {path.name}")
-    doctr_text, doctr_conf = _extract_doctr(path, models["ocr"])
-    print(f"    [doctr]     avg_conf={doctr_conf:.3f}  chars={len(doctr_text)}")
+       # Tier 2a — Adaptive Preprocess → docTR
+    # Tier 2a — Adaptive Preprocess → docTR
+
+    from preprocessing import preprocess_for_ocr, AutoAdaptiveConfig
+
+    preprocessed_paths = preprocess_for_ocr(
+        path,
+        cfg=AutoAdaptiveConfig()
+    )
+
+    ocr_input = preprocessed_paths[0] if preprocessed_paths else path
+
+    print(
+        f"    [doctr]     {path.name}  "
+        f"(preset={AutoAdaptiveConfig().name})"
+    )
+
+    doctr_text, doctr_conf = _extract_doctr(
+        ocr_input,
+        models["ocr"]
+    )
 
     # docTR got almost nothing → straight to Gemini
     if len(doctr_text.strip()) < DOCTR_MIN_CHARS:
