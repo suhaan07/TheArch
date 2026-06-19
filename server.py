@@ -10,7 +10,7 @@ that first call will be slow (~30s-2min depending on your machine), every call a
 is fast.
 
 Run with: uvicorn server:app --reload --port 8000
-Requires a .env file (see .env.example) with GEMINI_API_KEY set.
+Requires a .env file with GEMINI_API_KEY set.
 """
 import datetime
 import hashlib
@@ -63,6 +63,11 @@ DOC_TYPE_DEFAULT_SEMANTIC = {
 }
 
 SCAN_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff"}
+
+# Rough per-visit-type consultation length, used for queue ETA until there's
+# enough real started_at/completed_at history to compute an actual average.
+AVG_CONSULT_MINUTES = {"follow_up": 10, "new": 20, "admission": 30}
+CHECKIN_WINDOW_MINUTES = 30  # check-in opens this many minutes before the slot
 
 app = FastAPI(title="HeyDoc API")
 app.add_middleware(
@@ -130,6 +135,19 @@ def init_db():
             )
             """
         )
+        # sqlite has no "ADD COLUMN IF NOT EXISTS" — added after the table already
+        # existed in earlier versions of this app, so guard each with try/except.
+        for col in ("checked_in_at", "started_at", "completed_at"):
+            try:
+                conn.execute(f"ALTER TABLE appointments ADD COLUMN {col} TEXT")
+            except sqlite3.OperationalError:
+                pass  # column already exists
+        try:
+            # Doctor-controlled "running early/late" offset for today's queue —
+            # only meaningful for role='doctor' but harmless on other rows.
+            conn.execute("ALTER TABLE users ADD COLUMN queue_drift_minutes INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
 
 
 init_db()
@@ -236,13 +254,84 @@ def signin(req: SigninRequest):
 
 
 @app.get("/patients")
-def list_patients():
-    """All signed-up patients — lets doctor/tpa/lab pick a real patient to upload for."""
+def list_patients(doctor_id: str | None = None, hospital: str | None = None):
+    """
+    Patients a caller is allowed to see/act on:
+      - doctor_id given  -> patients with an accepted-or-later appointment with that doctor
+      - hospital given   -> (tpa/lab/admin) patients with an accepted-or-later
+                             appointment with ANY doctor at that hospital
+      - neither given    -> everyone (used internally; the frontend always scopes
+                             this for doctor/tpa/lab/admin callers)
+
+    "Accepted-or-later" = not 'pending' (never decided) and not 'declined'
+    (explicitly rejected) — this covers accepted/checked_in/in_consultation/
+    completed/no_show, i.e. once a doctor has taken on a patient, access
+    persists through and after the consultation, not just while still 'accepted'.
+    """
     with get_db() as conn:
-        rows = conn.execute(
-            "SELECT id, name FROM users WHERE role = 'patient' ORDER BY name"
-        ).fetchall()
+        if doctor_id:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT u.id, u.name FROM users u
+                JOIN appointments a ON a.patient_id = u.id
+                WHERE a.doctor_id = ? AND a.status NOT IN ('pending', 'declined')
+                ORDER BY u.name
+                """,
+                (doctor_id,),
+            ).fetchall()
+        elif hospital:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT p.id, p.name FROM users p
+                JOIN appointments a ON a.patient_id = p.id
+                JOIN users d ON d.id = a.doctor_id
+                WHERE a.status NOT IN ('pending', 'declined') AND LOWER(d.hospital) = LOWER(?)
+                ORDER BY p.name
+                """,
+                (hospital,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, name FROM users WHERE role = 'patient' ORDER BY name"
+            ).fetchall()
     return [dict(r) for r in rows]
+
+
+def authorize_patient_access(
+    conn: sqlite3.Connection,
+    role: str | None,
+    requester_id: str,
+    requester_hospital: str | None,
+    patient_id: str,
+) -> bool:
+    """
+    Business rule: a doctor may only access a patient's vault/uploads once they
+    have accepted an appointment with that patient — and access persists through
+    the rest of the queue lifecycle (checked_in/in_consultation/completed/no_show),
+    not just while still 'accepted'. TPA/lab/admin (insurance desk, diagnostics,
+    front desk/helpdesk) may only access a patient if that patient has an
+    accepted-or-later appointment with a doctor at the same hospital as their
+    own account. Patients always have access to their own records.
+    """
+    if requester_id == patient_id:
+        return True
+    if role == "doctor":
+        return conn.execute(
+            "SELECT 1 FROM appointments WHERE doctor_id = ? AND patient_id = ? AND status NOT IN ('pending', 'declined') LIMIT 1",
+            (requester_id, patient_id),
+        ).fetchone() is not None
+    if role in ("tpa", "lab", "admin"):
+        if not requester_hospital:
+            return False
+        return conn.execute(
+            """
+            SELECT 1 FROM appointments a JOIN users d ON d.id = a.doctor_id
+            WHERE a.patient_id = ? AND a.status NOT IN ('pending', 'declined') AND LOWER(d.hospital) = LOWER(?)
+            LIMIT 1
+            """,
+            (patient_id, requester_hospital),
+        ).fetchone() is not None
+    return True
 
 
 @app.get("/doctors")
@@ -253,6 +342,34 @@ def list_doctors():
             "SELECT id, name, dept, room, hospital, timings FROM users WHERE role = 'doctor' ORDER BY name"
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+class DriftAdjustment(BaseModel):
+    delta_minutes: int
+
+
+@app.get("/doctors/{doctor_id}/drift")
+def get_doctor_drift(doctor_id: str):
+    """How far ahead/behind schedule this doctor says they're running right now."""
+    with get_db() as conn:
+        row = conn.execute("SELECT queue_drift_minutes FROM users WHERE id = ?", (doctor_id,)).fetchone()
+    return {"drift_minutes": row["queue_drift_minutes"] if row else 0}
+
+
+@app.post("/doctors/{doctor_id}/drift")
+def adjust_doctor_drift(doctor_id: str, req: DriftAdjustment):
+    """
+    Doctor nudges their running-early/late offset by +/-5 (etc). This shifts the
+    estimated call time for every one of their waiting patients at once — the
+    actual scheduled slot times never change, just this offset applied on top.
+    """
+    with get_db() as conn:
+        row = conn.execute("SELECT queue_drift_minutes FROM users WHERE id = ?", (doctor_id,)).fetchone()
+        if not row:
+            return {"drift_minutes": 0}  # demo account with no real row — nothing to persist
+        new_value = row["queue_drift_minutes"] + req.delta_minutes
+        conn.execute("UPDATE users SET queue_drift_minutes = ? WHERE id = ?", (new_value, doctor_id))
+    return {"drift_minutes": new_value}
 
 
 # ── Appointments ────────────────────────────────────────────────────────────
@@ -285,6 +402,7 @@ def appointment_public(row: sqlite3.Row, conn: sqlite3.Connection) -> dict:
         "time": row["time"],
         "type": row["type"],
         "status": row["status"],
+        "checked_in_at": row["checked_in_at"],
     }
 
 
@@ -323,14 +441,106 @@ def list_appointments(patient_id: str | None = None, doctor_id: str | None = Non
 
 @app.post("/appointments/{appointment_id}/status")
 def update_appointment_status(appointment_id: str, req: AppointmentStatusUpdate):
-    if req.status not in {"pending", "accepted", "declined"}:
-        raise HTTPException(400, "status must be 'pending', 'accepted', or 'declined'")
+    # 'checked_in' is deliberately excluded here — it has its own endpoint
+    # below that enforces the check-in window.
+    valid = {"pending", "accepted", "declined", "in_consultation", "completed", "no_show"}
+    if req.status not in valid:
+        raise HTTPException(400, f"status must be one of {sorted(valid)}")
     with get_db() as conn:
         if not conn.execute("SELECT id FROM appointments WHERE id = ?", (appointment_id,)).fetchone():
             raise HTTPException(404, "appointment not found")
-        conn.execute("UPDATE appointments SET status = ? WHERE id = ?", (req.status, appointment_id))
+        now = datetime.datetime.now().isoformat()
+        if req.status == "in_consultation":
+            conn.execute("UPDATE appointments SET status = ?, started_at = ? WHERE id = ?", (req.status, now, appointment_id))
+        elif req.status == "completed":
+            conn.execute("UPDATE appointments SET status = ?, completed_at = ? WHERE id = ?", (req.status, now, appointment_id))
+        else:
+            conn.execute("UPDATE appointments SET status = ? WHERE id = ?", (req.status, appointment_id))
         row = conn.execute("SELECT * FROM appointments WHERE id = ?", (appointment_id,)).fetchone()
         return appointment_public(row, conn)
+
+
+@app.post("/appointments/{appointment_id}/check-in")
+def check_in_appointment(appointment_id: str):
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM appointments WHERE id = ?", (appointment_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "appointment not found")
+        if row["status"] != "accepted":
+            raise HTTPException(400, f"can only check in from 'accepted' status (current: {row['status']})")
+
+        # Appointment times and datetime.now() are both naive local-clock values
+        # (the frontend sends `${date}T${time}:00` straight from the patient's
+        # wall clock, no timezone conversion anywhere) — directly comparable.
+        # NOTE: this was originally written against utcnow(), which silently
+        # broke the check-in window by the server's UTC offset (e.g. ~5.5h in
+        # IST) — utcnow() must never be mixed with these naive-local values.
+        appt_time = datetime.datetime.fromisoformat(row["time"])
+        mins_until = (appt_time - datetime.datetime.now()).total_seconds() / 60
+        if mins_until > CHECKIN_WINDOW_MINUTES:
+            raise HTTPException(400, f"check-in opens {CHECKIN_WINDOW_MINUTES} minutes before your appointment")
+
+        now = datetime.datetime.now().isoformat()
+        conn.execute(
+            "UPDATE appointments SET status = 'checked_in', checked_in_at = ? WHERE id = ?",
+            (now, appointment_id),
+        )
+        updated = conn.execute("SELECT * FROM appointments WHERE id = ?", (appointment_id,)).fetchone()
+        return appointment_public(updated, conn)
+
+
+@app.get("/appointments/{appointment_id}/queue-position")
+def get_queue_position(appointment_id: str):
+    with get_db() as conn:
+        appt = conn.execute("SELECT * FROM appointments WHERE id = ?", (appointment_id,)).fetchone()
+        if not appt:
+            raise HTTPException(404, "appointment not found")
+
+        doctor = conn.execute("SELECT queue_drift_minutes FROM users WHERE id = ?", (appt["doctor_id"],)).fetchone()
+        drift_minutes = doctor["queue_drift_minutes"] if doctor else 0
+
+        if appt["status"] not in ("checked_in", "in_consultation"):
+            return {
+                "position": None, "ahead_count": None, "status": appt["status"],
+                "estimated_wait_minutes": None, "is_current": False,
+                "estimated_call_time": None, "drift_minutes": drift_minutes,
+            }
+
+        appt_day = appt["time"][:10]  # YYYY-MM-DD prefix
+        queue = conn.execute(
+            """
+            SELECT * FROM appointments
+            WHERE doctor_id = ? AND status IN ('checked_in', 'in_consultation')
+              AND substr(time, 1, 10) = ?
+            ORDER BY time ASC, COALESCE(checked_in_at, '') ASC
+            """,
+            (appt["doctor_id"], appt_day),
+        ).fetchall()
+
+        ids_in_order = [r["id"] for r in queue]
+        idx = ids_in_order.index(appointment_id)
+        ahead = queue[:idx]
+        ahead_count = len(ahead)
+        estimated_wait_minutes = sum(AVG_CONSULT_MINUTES.get(r["type"], 15) for r in ahead)
+
+        # The countdown patients see targets the *scheduled* slot time shifted by
+        # the doctor's manual running-early/late offset — not an auto-computed
+        # estimate. The doctor is the one who knows whether they're behind today.
+        scheduled = datetime.datetime.fromisoformat(appt["time"])
+        estimated_call_time = scheduled + datetime.timedelta(minutes=drift_minutes)
+
+        # "You're next" notification is handled client-side (app.js maybeNotifyNext) —
+        # the browser Notification API + in-app banner, no server-side trigger needed.
+
+        return {
+            "position": idx + 1,
+            "ahead_count": ahead_count,
+            "status": appt["status"],
+            "estimated_wait_minutes": estimated_wait_minutes,
+            "is_current": appt["status"] == "in_consultation",
+            "estimated_call_time": estimated_call_time.isoformat(),
+            "drift_minutes": drift_minutes,
+        }
 
 
 # ── RAG pipeline (ingestion / imaging / retrieval / advanced_rag) ──────────────
@@ -374,8 +584,14 @@ class ChatRequest(BaseModel):
 async def upload_document(
     patient_id: str = Form(...),
     uploaded_by: str = Form(...),
+    requester_role: str | None = Form(None),
+    requester_hospital: str | None = Form(None),
     file: UploadFile = File(...),
 ):
+    with get_db() as conn:
+        if not authorize_patient_access(conn, requester_role, uploaded_by, requester_hospital, patient_id):
+            raise HTTPException(403, "you don't have access to this patient's records")
+
     models, imaging_models = get_rag_models()
 
     dest_dir = ingestion.UPLOAD_DIR / patient_id
@@ -418,8 +634,15 @@ async def upload_document(
 
 
 @app.get("/documents/{patient_id}")
-def list_documents(patient_id: str):
+def list_documents(
+    patient_id: str,
+    requester_id: str | None = None,
+    requester_role: str | None = None,
+    requester_hospital: str | None = None,
+):
     with get_db() as conn:
+        if requester_id and not authorize_patient_access(conn, requester_role, requester_id, requester_hospital, patient_id):
+            raise HTTPException(403, "you don't have access to this patient's records")
         rows = conn.execute(
             "SELECT * FROM documents WHERE patient_id = ? ORDER BY uploaded_at",
             (patient_id,),

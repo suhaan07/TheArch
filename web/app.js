@@ -96,7 +96,7 @@ function fmtTime(iso) {
   return d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' });
 }
 function minsUntil(iso) {
-  return Math.round((new Date(iso) - new Date('2026-06-18T15:05:00')) / 60000);
+  return Math.round((new Date(iso) - new Date()) / 60000);
 }
 
 function icon(name, size = 18, color = 'currentColor', cls = '') {
@@ -180,27 +180,43 @@ const state = {
   doctor: { selectedPatient: null },
   tpa: { selectedPatient: null },
   lab: { selectedPatient: null },
-  uploadForPatient: { patientId: MOCK.patients[0].id },
-  admin: { selected: null, verified: false },
+  uploadForPatient: { patientId: null },
+  admin: { selected: null, verified: false, selectedPatient: null },
   sidebarOpen: false,
   documents: {},          // { [patientId]: Array<doc> } — populated by ensureDocuments()
   uploadStatus: {},        // { [contextKey]: {state, name, ...} } — upload progress/result
-  patients: MOCK.patients.slice(),  // real signed-up patients merged in by ensurePatients()
+  patients: [],            // patients this doctor/tpa/lab is authorized to see — see ensurePatients()
   doctors: MOCK.doctors.slice(),    // real signed-up doctors merged in by ensureDoctors()
   appointments: {},        // { 'patient:<id>' | 'doctor:<id>': Array<appointment> }
   bookingError: null,
+  queuePosition: null,     // { appointmentId, position, ahead_count, estimated_wait_minutes, is_current, estimated_call_time, drift_minutes }
+  queueError: null,
+  doctorDrift: null,       // minutes running behind (+) / ahead (-) schedule — null until ensureDoctorDrift() loads it
 };
+
+const CHECKIN_WINDOW_MINUTES = 30; // mirrors server.py's CHECKIN_WINDOW_MINUTES
 
 /* ============================================================
    Real document storage + RAG chat — talks to server.py
    ============================================================ */
 const _docsFetchedFor = new Set();
 
-async function ensureDocuments(patientId) {
+async function ensureDocuments(patientId, requester) {
   if (_docsFetchedFor.has(patientId)) return;
   _docsFetchedFor.add(patientId);
   try {
-    const res = await fetch(`${API_BASE}/documents/${patientId}`);
+    let url = `${API_BASE}/documents/${patientId}`;
+    if (requester) {
+      const params = new URLSearchParams({ requester_id: requester.id, requester_role: requester.role });
+      if (requester.hospital) params.set('requester_hospital', requester.hospital);
+      url += `?${params}`;
+    }
+    const res = await fetch(url);
+    if (res.status === 403) {
+      state.documents[patientId] = { forbidden: true };
+      render();
+      return;
+    }
     const rows = await res.json();
     state.documents[patientId] = rows.map(d => ({
       id: d.id,
@@ -225,13 +241,24 @@ let _patientsFetched = false;
 async function ensurePatients() {
   if (_patientsFetched) return;
   _patientsFetched = true;
+  const role = state.user?.role;
+  if (role !== 'doctor' && role !== 'tpa' && role !== 'lab' && role !== 'admin') return;
   try {
-    const res = await fetch(`${API_BASE}/patients`);
-    const real = await res.json();
-    const seen = new Set(real.map(p => p.id));
-    state.patients = [...real, ...MOCK.patients.filter(p => !seen.has(p.id))];
+    // Doctors only see patients with an accepted appointment with them; TPA/lab/
+    // admin (insurance desk, diagnostics, front desk/helpdesk) only see patients
+    // with an accepted appointment with a doctor at their own hospital. No mock
+    // fallback here — showing unauthorized patients (even demo ones) would
+    // defeat the point of the restriction.
+    const params = role === 'doctor'
+      ? `doctor_id=${encodeURIComponent(state.user.id)}`
+      : `hospital=${encodeURIComponent(state.user.hospital || '')}`;
+    const res = await fetch(`${API_BASE}/patients?${params}`);
+    state.patients = await res.json();
   } catch (err) {
-    // backend not running yet — keep the mock list so the UI still works
+    state.patients = []; // fail closed if the backend is unreachable
+  }
+  if (!state.patients.some(p => p.id === state.uploadForPatient.patientId)) {
+    state.uploadForPatient.patientId = state.patients[0]?.id || null;
   }
   render();
 }
@@ -270,6 +297,51 @@ function refreshAppointments(role, id) {
   return ensureAppointments(role, id);
 }
 
+// Single shared poll slot — only one queue-style page is ever visible at a
+// time, so one timer is enough. Always stopPolling() before starting a new
+// one so navigating away (or logging out) never leaves a stray timer running.
+let _pollHandle = null;
+function startPolling(fn, ms) {
+  stopPolling();
+  _pollHandle = setInterval(fn, ms);
+}
+function stopPolling() {
+  if (_pollHandle) { clearInterval(_pollHandle); _pollHandle = null; }
+}
+
+// A real, honest "time waited" clock — ticks every second from checked_in_at,
+// updating one DOM node directly rather than going through the full render()
+// (re-rendering the whole app every second would be wasteful and flickery).
+// Counts down to a target time (the scheduled slot adjusted by the doctor's
+// running-early/late offset) — re-targets itself whenever the doctor changes
+// that offset and a fresh poll brings in a new estimated_call_time.
+let _tickHandle = null;
+let _tickTarget = null;
+function startCountdown(targetIso) {
+  if (_tickTarget === targetIso && _tickHandle) return; // already counting down to this exact target
+  stopTicking();
+  _tickTarget = targetIso;
+  const target = new Date(targetIso);
+  const update = () => {
+    const el = document.getElementById('queue-elapsed');
+    if (!el) { stopTicking(); return; } // navigated away without nav()/logout() catching it
+    const secs = Math.round((target - new Date()) / 1000);
+    if (secs <= 0) { el.textContent = 'Any moment now'; return; }
+    const h = Math.floor(secs / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    const s = secs % 60;
+    el.textContent = h > 0
+      ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+      : `${m}:${String(s).padStart(2, '0')}`;
+  };
+  update();
+  _tickHandle = setInterval(update, 1000);
+}
+function stopTicking() {
+  if (_tickHandle) { clearInterval(_tickHandle); _tickHandle = null; }
+  _tickTarget = null;
+}
+
 async function bookAppointment(patientId, doctorId, time, type) {
   try {
     await apiCall('/appointments', { patient_id: patientId, doctor_id: doctorId, time, type });
@@ -285,11 +357,87 @@ async function bookAppointment(patientId, doctorId, time, type) {
 async function setAppointmentStatus(appointmentId, status, doctorId) {
   try {
     await apiCall(`/appointments/${appointmentId}/status`, { status });
+    // Accepting grants access to a new patient — the cached authorized-patients
+    // list (Upload for patient / Patient lookup dropdowns) must refresh right
+    // away, not just on the doctor's next login.
+    if (status === 'accepted') _patientsFetched = false;
     await refreshAppointments('doctor', doctorId);
   } catch (err) {
     state.bookingError = err.message;
     render();
   }
+}
+
+// ── Live queue (patient side) ──────────────────────────────────────────────
+let _notifiedForAppt = null; // browser Notification should fire once per appointment, not every poll
+
+function maybeNotifyNext(appointmentId, aheadCount) {
+  if (aheadCount === null || aheadCount > 1) return;
+  if (_notifiedForAppt === appointmentId) return;
+  _notifiedForAppt = appointmentId;
+  if (typeof Notification === 'undefined') return;
+  const fire = () => new Notification('HeyDoc', { body: "You're next — please head to the clinic now." });
+  if (Notification.permission === 'granted') fire();
+  else if (Notification.permission !== 'denied') Notification.requestPermission().then(p => { if (p === 'granted') fire(); });
+}
+
+async function fetchQueuePosition(appointmentId) {
+  try {
+    const res = await fetch(`${API_BASE}/appointments/${appointmentId}/queue-position`);
+    const data = await res.json();
+    state.queuePosition = { appointmentId, ...data };
+    maybeNotifyNext(appointmentId, data.ahead_count);
+  } catch (err) {
+    // transient network hiccup — keep showing the last known position
+  }
+  render();
+}
+
+const _queuePositionRequested = new Set();
+function ensureQueuePosition(appointmentId) {
+  if (_queuePositionRequested.has(appointmentId)) return;
+  _queuePositionRequested.add(appointmentId);
+  fetchQueuePosition(appointmentId);
+}
+
+async function checkInNow(appointmentId, patientId) {
+  state.queueError = null;
+  try {
+    await apiCall(`/appointments/${appointmentId}/check-in`, {});
+    await refreshAppointments('patient', patientId);
+  } catch (err) {
+    state.queueError = err.message;
+    render();
+  }
+}
+
+// ── Doctor "running early/late" drift — shifts every waiting patient's
+// estimated call time at once, without touching anyone's booked slot. ──────
+async function ensureDoctorDrift(doctorId) {
+  if (state.doctorDrift !== null) return;
+  try {
+    const res = await fetch(`${API_BASE}/doctors/${doctorId}/drift`);
+    const data = await res.json();
+    state.doctorDrift = data.drift_minutes;
+  } catch (err) {
+    state.doctorDrift = 0;
+  }
+  render();
+}
+
+async function adjustDrift(doctorId, delta) {
+  try {
+    const res = await fetch(`${API_BASE}/doctors/${doctorId}/drift`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ delta_minutes: delta }),
+    });
+    const data = await res.json();
+    state.doctorDrift = data.drift_minutes;
+  } catch (err) {
+    state.queueError = err.message;
+  }
+  render();
 }
 
 function uploadStatusHtml(status) {
@@ -310,6 +458,10 @@ async function uploadDocument(patientId, uploadedBy, file, statusKey) {
   const formData = new FormData();
   formData.append('patient_id', patientId);
   formData.append('uploaded_by', uploadedBy);
+  if (state.user) {
+    formData.append('requester_role', state.user.role);
+    if (state.user.hospital) formData.append('requester_hospital', state.user.hospital);
+  }
   formData.append('file', file);
 
   state.uploadStatus[statusKey] = { state: 'uploading', name: file.name };
@@ -374,8 +526,19 @@ function render() {
   }
 }
 
-function nav(page) { state.page = page; state.sidebarOpen = false; render(); }
+function nav(page) {
+  stopPolling(); // the queue page (if any) restarts its own poll on render
+  stopTicking();
+  _queuePositionRequested.clear(); // re-fetch fresh every time a queue page is entered
+  state.queueError = null;
+  state.page = page;
+  state.sidebarOpen = false;
+  render();
+}
 function logout() {
+  stopPolling();
+  stopTicking();
+  _queuePositionRequested.clear();
   state.user = null;
   state.page = 'dashboard';
   state.auth = { mode: 'signin', step: 1, role: null, staffType: null, error: null, loading: false };
@@ -386,6 +549,9 @@ function logout() {
   // who signed up after the directory was first fetched, wouldn't show).
   state.documents = {};
   state.appointments = {};
+  state.queuePosition = null;
+  state.queueError = null;
+  state.doctorDrift = null;
   _docsFetchedFor.clear();
   _apptsFetchedFor.clear();
   _patientsFetched = false;
@@ -841,34 +1007,72 @@ function renderPatientAppointments(appts) {
 }
 
 function renderPatientQueue(appts) {
-  const next = appts[0];
-  if (!next) return `${pageHeader('My queue', 'Check in and track your live position.')}<div class="card">${emptyState('calendar', 'No upcoming appointments', 'Book an appointment to use digital check-in.')}</div>`;
-  const mins = minsUntil(next.time);
-  const checkInOpen = mins <= 30;
-  const qEntry = MOCK.queue.find(q => q.appointmentId === next.id);
-  let box;
-  if (!checkInOpen) {
-    box = `
-      <div class="queue-wait-box">
-        ${icon('clock', 20, 'var(--ink500)')}
-        <div style="font-weight:600;font-size:13.5px;margin-top:8px">Check-in opens 30 minutes before your appointment</div>
-        <div style="font-size:12.5px;color:var(--ink500);margin-top:2px">Opens in ${mins - 30} min</div>
-      </div>`;
-  } else if (qEntry?.checkedIn) {
-    box = `
-      <div class="queue-checked-box">
-        <div class="queue-checked-label">You're checked in</div>
-        <div class="queue-position">#${qEntry.position}</div>
-        <div class="queue-eta">in line · est. wait ~${qEntry.position * 8} min</div>
-      </div>`;
-  } else {
-    box = `<button class="btn btn-primary btn-block">Check in now</button>`;
+  const next = appts.find(a => a.status === 'checked_in' || a.status === 'in_consultation')
+    || appts.find(a => a.status === 'accepted')
+    || null;
+
+  if (!next) {
+    stopPolling();
+    stopTicking();
+    return `${pageHeader('My queue', 'Check in and track your live position.')}<div class="card">${emptyState('calendar', 'No upcoming appointments', 'Book an accepted appointment to use digital check-in.')}</div>`;
   }
+
+  const isLive = next.status === 'checked_in' || next.status === 'in_consultation';
+  let box;
+
+  if (isLive) {
+    if (!_pollHandle) startPolling(() => fetchQueuePosition(next.id), 15000);
+    ensureQueuePosition(next.id);
+    const pos = state.queuePosition && state.queuePosition.appointmentId === next.id ? state.queuePosition : null;
+    const countdown = pos && pos.estimated_call_time
+      ? `<div class="queue-elapsed">Estimated call in <span id="queue-elapsed">0:00</span></div>` : '';
+    const driftNote = pos && pos.drift_minutes
+      ? `<div class="queue-elapsed">${pos.drift_minutes > 0 ? `Doctor is running ${pos.drift_minutes} min behind schedule` : `Doctor is running ${-pos.drift_minutes} min ahead of schedule`}</div>` : '';
+
+    if (pos && pos.estimated_call_time) startCountdown(pos.estimated_call_time);
+
+    if (!pos) {
+      box = `<div class="queue-wait-box">${icon('clock', 20, 'var(--ink500)')}<div style="font-weight:600;font-size:13.5px;margin-top:8px">Loading your position…</div></div>`;
+    } else if (pos.is_current) {
+      box = `
+        <div class="queue-checked-box">
+          <div class="queue-checked-label">You're up now</div>
+          <div class="queue-eta">the doctor has called you in</div>
+        </div>`;
+    } else {
+      const upNext = pos.ahead_count <= 1;
+      box = `
+        <div class="queue-checked-box" style="${upNext ? 'background:var(--amber50)' : ''}">
+          <div class="queue-checked-label" style="${upNext ? 'color:var(--amber600)' : ''}">${upNext ? "You're next — head to the clinic now" : "You're checked in"}</div>
+          <div class="queue-position" style="${upNext ? 'color:var(--amber600)' : ''}">#${pos.position}</div>
+          <div class="queue-eta">${pos.ahead_count} ahead · est. wait ~${pos.estimated_wait_minutes} min</div>
+          ${countdown}
+          ${driftNote}
+        </div>`;
+    }
+  } else {
+    stopPolling();
+    stopTicking();
+    const mins = minsUntil(next.time);
+    const checkInOpen = mins <= CHECKIN_WINDOW_MINUTES;
+    if (!checkInOpen) {
+      box = `
+        <div class="queue-wait-box">
+          ${icon('clock', 20, 'var(--ink500)')}
+          <div style="font-weight:600;font-size:13.5px;margin-top:8px">Check-in opens ${CHECKIN_WINDOW_MINUTES} minutes before your appointment</div>
+          <div style="font-size:12.5px;color:var(--ink500);margin-top:2px">Opens in ${mins - CHECKIN_WINDOW_MINUTES} min</div>
+        </div>`;
+    } else {
+      box = `<button class="btn btn-primary btn-block" onclick="checkInNow('${next.id}','${state.user.id}')">Check in now</button>`;
+    }
+  }
+
   return `
     ${pageHeader('My queue', 'Check in and track your live position in real time.')}
+    ${state.queueError ? `<div class="auth-error mb-14">${esc(state.queueError)}</div>` : ''}
     <div class="card">
       <div style="font-weight:700;font-size:15px;margin-bottom:4px">${esc(next.doctor_name || '')}</div>
-      <div style="font-size:13px;color:var(--ink500);margin-bottom:18px">${fmtTime(next.time)} today</div>
+      <div style="font-size:13px;color:var(--ink500);margin-bottom:18px">${fmtTime(next.time)} · ${esc(new Date(next.time).toLocaleDateString())}</div>
       ${box}
     </div>`;
 }
@@ -878,10 +1082,19 @@ function renderPatientQueue(appts) {
    ============================================================ */
 function vaultView(patientId, emphasize) {
   if (state.documents[patientId] === undefined) {
-    ensureDocuments(patientId);
+    ensureDocuments(patientId, state.user);
     return emptyState('file', 'Loading records…');
   }
-  const docs = state.documents[patientId] || [];
+  const docs = state.documents[patientId];
+  if (docs && docs.forbidden) {
+    return emptyState(
+      'shield',
+      'No access to this patient',
+      state.user.role === 'doctor'
+        ? "You don't have an accepted appointment with this patient."
+        : "This patient isn't under a doctor at your hospital."
+    );
+  }
   const order = emphasize
     ? ['diagnosis', 'medication_history', 'lab_reports', 'surgical_history', 'follow_up_notes', 'patient_information']
     : Object.keys(SEMANTIC);
@@ -899,6 +1112,12 @@ function setUploadForPatientId(id) { state.uploadForPatient.patientId = id; rend
 function uploadForPatient(role) {
   const { patientId } = state.uploadForPatient;
   const status = state.uploadStatus.staffUpload;
+  if (!state.patients.length) {
+    const why = role === 'doctor'
+      ? "You don't have any patients yet — accept an appointment request first."
+      : "You don't have any patients yet — this list only shows patients with an accepted appointment with a doctor at your hospital.";
+    return `<div class="card">${emptyState('user', 'No patients yet', why)}</div>`;
+  }
   return `
     <div class="card">
       <div class="field"><div class="field-label">Patient</div>
@@ -978,19 +1197,59 @@ function renderDoctorApp() {
         <button class="btn btn-primary">Save changes</button>
       </div>`;
   } else if (state.page === 'queue') {
-    const queued = myAppts.filter(a => a.status === 'accepted').sort((a, b) => new Date(a.time) - new Date(b.time));
+    const inQueue = myAppts.filter(a => a.status === 'checked_in' || a.status === 'in_consultation')
+      .sort((a, b) => new Date(a.time) - new Date(b.time));
+    const waiting = myAppts.filter(a => a.status === 'accepted')
+      .sort((a, b) => new Date(a.time) - new Date(b.time));
+
+    if (inQueue.length) { if (!_pollHandle) startPolling(() => refreshAppointments('doctor', user.id), 15000); }
+    else stopPolling();
+
+    if (state.doctorDrift === null) ensureDoctorDrift(user.id);
+    const drift = state.doctorDrift;
+    const driftLabel = drift === null ? 'Loading…'
+      : drift === 0 ? 'Running on schedule'
+      : drift > 0 ? `Running ${drift} min behind` : `Running ${-drift} min ahead`;
+
     content = `
-      ${pageHeader('Patient queue', 'Accepted appointments, in order.')}
-      ${queued.length ? queued.map((a, i) => `
+      ${pageHeader('Patient queue', 'Checked-in patients, in slot order.')}
+      <div class="card mb-20 flex-between">
+        <div>
+          <div style="font-weight:700;font-size:14px">${esc(driftLabel)}</div>
+          <div style="font-size:12px;color:var(--ink500);margin-top:2px">Running early or behind today? Adjust here — every waiting patient's estimate updates right away.</div>
+        </div>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-ghost" onclick="adjustDrift('${user.id}', -5)">−5 min</button>
+          <button class="btn btn-ghost" onclick="adjustDrift('${user.id}', 5)">+5 min</button>
+        </div>
+      </div>
+      ${inQueue.length ? inQueue.map((a, i) => {
+          const current = a.status === 'in_consultation';
+          return `
+            <div class="card mb-10 queue-row" style="${current ? 'border-color:var(--teal600);background:var(--teal50)' : ''}">
+              <div class="queue-row-num" style="${current ? 'background:var(--teal600);color:#fff' : ''}">${i + 1}</div>
+              <div style="flex:1">
+                <div style="font-weight:600;font-size:14px">${esc(a.patient_name || '')}</div>
+                <div style="font-size:12.5px;color:var(--ink500)">${fmtTime(a.time)} · ${a.type === 'new' ? 'New patient' : a.type === 'admission' ? 'Admission' : 'Follow-up'} · ${current ? 'in consultation' : 'checked in'}</div>
+              </div>
+              <button class="btn btn-secondary" onclick="goToLookup('${a.patient_id}')">View vault</button>
+              ${current
+                ? `<button class="btn btn-primary" onclick="setAppointmentStatus('${a.id}','completed','${user.id}')">Mark complete</button>`
+                : `<button class="btn btn-primary" onclick="setAppointmentStatus('${a.id}','in_consultation','${user.id}')">Start consultation</button>
+                   <button class="btn btn-ghost" onclick="setAppointmentStatus('${a.id}','no_show','${user.id}')">No-show</button>`}
+            </div>`;
+        }).join('') : emptyState('clock', 'No one checked in yet', 'Patients show up here once they check in for an accepted appointment.')}
+
+      ${waiting.length ? `
+        <div class="section-title" style="margin-top:24px">Accepted — waiting for check-in</div>
+        ${waiting.map(a => `
           <div class="card mb-10 queue-row">
-            <div class="queue-row-num">${i + 1}</div>
             <div style="flex:1">
               <div style="font-weight:600;font-size:14px">${esc(a.patient_name || '')}</div>
-              <div style="font-size:12.5px;color:var(--ink500)">${fmtTime(a.time)} · ${esc(new Date(a.time).toLocaleDateString())} · ${a.type === 'new' ? 'New patient' : a.type === 'admission' ? 'Admission' : 'Follow-up'}</div>
+              <div style="font-size:12.5px;color:var(--ink500)">${fmtTime(a.time)} · ${esc(new Date(a.time).toLocaleDateString())}</div>
             </div>
-            <button class="btn btn-secondary" onclick="goToLookup('${a.patient_id}')">View vault</button>
-            <button class="btn btn-secondary" onclick="goToUploadFor('${a.patient_id}')">Upload</button>
-          </div>`).join('') : emptyState('clock', 'No one in queue', 'Accepted appointments will appear here as soon as you accept them.')}`;
+            ${badge('not checked in', 'var(--ink100)', 'var(--ink500)')}
+          </div>`).join('')}` : ''}`;
   } else if (state.page === 'lookup') {
     const selected = state.doctor.selectedPatient;
     content = `
@@ -1154,12 +1413,16 @@ function intakeForm(appt) {
     </div>`;
 }
 
+function setAdminSelectedPatient(id) { state.admin.selectedPatient = id; render(); }
+
 function renderAdminApp() {
   const user = state.user;
   const navItems = [
     { key: 'dashboard', label: 'Dashboard', icon: 'grid' },
     { key: 'intake', label: 'Intake forms', icon: 'file' },
     { key: 'admissions', label: "Today's arrivals", icon: 'calendar' },
+    { key: 'lookup', label: 'Patient lookup', icon: 'search' },
+    { key: 'upload', label: 'Upload for patient', icon: 'upload' },
   ];
   const admissions = MOCK.appointments.filter(a => a.type === 'admission' || a.type === 'new');
 
@@ -1196,6 +1459,19 @@ function renderAdminApp() {
             ${admissions.map(a => `<option value="${a.id}">${esc(MOCK.patients.find(p => p.id === a.patientId)?.name || '')}</option>`).join('')}
           </select>
         </div>` : intakeForm(selected)}`;
+  } else if (state.page === 'lookup') {
+    const selectedPatient = state.admin.selectedPatient;
+    content = `
+      ${pageHeader('Patient lookup', "Search a patient to view their full vault.")}
+      <div class="field"><div class="field-label">Patient</div>
+        <select class="input" onchange="setAdminSelectedPatient(this.value)">
+          <option value="" ${!selectedPatient ? 'selected' : ''}>Select a patient...</option>
+          ${state.patients.map(p => `<option value="${p.id}" ${p.id === selectedPatient ? 'selected' : ''}>${esc(p.name)} (${p.id})</option>`).join('')}
+        </select>
+      </div>
+      ${selectedPatient ? vaultView(selectedPatient, false) : ''}`;
+  } else if (state.page === 'upload') {
+    content = `${pageHeader('Upload for patient', "Add a scan, report, or note directly to a patient's vault.")}${uploadForPatient('admin')}`;
   }
 
   return shell('admin', user.name, navItems, state.page, content);
