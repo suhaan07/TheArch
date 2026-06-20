@@ -51,7 +51,7 @@ logger.setLevel(logging.INFO)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-2.5-flash-lite"
 
 # Confidence thresholds (0-100 scale)
 CONFIDENCE_HIGH   = 75

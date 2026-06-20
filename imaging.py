@@ -27,7 +27,7 @@ from pathlib import Path
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
-GEMINI_MODEL              = "gemini-2.5-flash"
+GEMINI_MODEL              = "gemini-2.5-flash-lite"
 BIOVILT_MODEL_ID          = "microsoft/BiomedVLP-BioViL-T"
 BIOVILT_ABNORMAL_THRESHOLD = 0.22    # phrase similarity above this = likely present
 EMBED_BATCH_SIZE           = 32

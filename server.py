@@ -655,7 +655,11 @@ def _build_admission_documents(conn: sqlite3.Connection, collection, admission_i
     """Re-assemble each admission document's extracted text/diagnosis from
     ChromaDB (already stored there by the normal ingestion pipeline) — no
     separate text storage needed, just look it back up by patient_id+file_name."""
-    rows = conn.execute("SELECT * FROM documents WHERE admission_id = ?", (admission_id,)).fetchall()
+    # Newest first per slot — a "Replace file" re-upload must take precedence
+    # over whatever was there before, not silently lose to it.
+    rows = conn.execute(
+        "SELECT * FROM documents WHERE admission_id = ? ORDER BY uploaded_at DESC", (admission_id,)
+    ).fetchall()
     out = []
     for r in rows:
         res = collection.get(
@@ -683,12 +687,14 @@ def _run_admission_verification(admission_id: str) -> list[dict]:
             raise HTTPException(404, "admission not found")
 
         documents = _build_admission_documents(conn, models["collection"], admission_id)
+        patient = conn.execute("SELECT name FROM users WHERE id = ?", (adm_row["patient_id"],)).fetchone()
         admission_dict = {
             "payment_path": adm_row["payment_path"],
             "is_corporate": bool(adm_row["is_corporate"]),
             "estimated_cost": adm_row["estimated_cost"],
             "admission_reason": adm_row["admission_reason"],
             "preauth": json.loads(adm_row["preauth_json"]) if adm_row["preauth_json"] else {},
+            "patient_name": patient["name"] if patient else None,
         }
         results = admission_engine.verify_admission(admission_dict, documents, models)
 
@@ -791,7 +797,26 @@ def list_admissions(appointment_id: str | None = None, status: str | None = None
                     "patient_id": r["patient_id"], "patient_name": patient["name"] if patient else r["patient_id"],
                 })
             return out
-        raise HTTPException(400, "pass either appointment_id, or status=needs_review&hospital=")
+        if hospital:
+            # Real, hospital-scoped admissions for the front desk's "Today's
+            # arrivals" / intake views — paid (confirmed/redeemed) by default
+            # since that's the point where the front desk actually needs to
+            # act on a patient; pass an explicit status to narrow further.
+            query = """
+                SELECT a.* FROM admissions a
+                JOIN users d ON d.id = a.doctor_id
+                WHERE LOWER(d.hospital) = LOWER(?)
+            """
+            params = [hospital]
+            if status:
+                query += " AND a.status = ?"
+                params.append(status)
+            else:
+                query += " AND a.status IN ('confirmed', 'redeemed')"
+            query += " ORDER BY a.admission_date"
+            rows = conn.execute(query, params).fetchall()
+            return [admission_public(r, conn) for r in rows]
+        raise HTTPException(400, "pass appointment_id, status=needs_review&hospital=, or hospital=")
 
 
 class AdmissionUpdateRequest(BaseModel):
@@ -852,10 +877,11 @@ async def upload_admission_document(
     with open(dest_path, "wb") as out:
         shutil.copyfileobj(file.file, out)
 
-    is_scan_image = (
-        dest_path.suffix.lower() in SCAN_IMAGE_EXTS
-        and imaging.detect_modality(dest_path) != "unknown_scan"
-    )
+    # Any image extension goes through Gemini Vision, not just filenames that
+    # happen to mention a modality (e.g. "IMG_2384.jpg", WhatsApp exports) --
+    # detect_modality() only picks which prompt to use; imaging.py already
+    # has a sensible generic-description fallback for "unknown_scan".
+    is_scan_image = dest_path.suffix.lower() in SCAN_IMAGE_EXTS
     if is_scan_image:
         result = imaging.ingest_scan(patient_id, dest_path, models, imaging_models)
         pipeline = "imaging"
@@ -922,9 +948,13 @@ def resolve_checklist_item(item_id: str, req: ChecklistResolveRequest):
         item = conn.execute("SELECT * FROM admission_checklist_items WHERE id = ?", (item_id,)).fetchone()
         if not item:
             raise HTTPException(404, "checklist item not found")
+        default_note = (
+            "Verified by hospital admin" if req.status == "verified"
+            else "There seems to be a problem with this document — please re-upload it."
+        )
         conn.execute(
             "UPDATE admission_checklist_items SET status = ?, explanation = ? WHERE id = ?",
-            (req.status, req.note or "Resolved by hospital admin", item_id),
+            (req.status, req.note or default_note, item_id),
         )
         admission_id = item["admission_id"]
         adm_row = conn.execute("SELECT * FROM admissions WHERE id = ?", (admission_id,)).fetchone()
@@ -1022,10 +1052,11 @@ async def upload_document(
     with open(dest_path, "wb") as out:
         shutil.copyfileobj(file.file, out)
 
-    is_scan_image = (
-        dest_path.suffix.lower() in SCAN_IMAGE_EXTS
-        and imaging.detect_modality(dest_path) != "unknown_scan"
-    )
+    # Any image extension goes through Gemini Vision, not just filenames that
+    # happen to mention a modality (e.g. "IMG_2384.jpg", WhatsApp exports) --
+    # detect_modality() only picks which prompt to use; imaging.py already
+    # has a sensible generic-description fallback for "unknown_scan".
+    is_scan_image = dest_path.suffix.lower() in SCAN_IMAGE_EXTS
 
     if is_scan_image:
         result = imaging.ingest_scan(patient_id, dest_path, models, imaging_models)

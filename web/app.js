@@ -175,13 +175,15 @@ const state = {
   user: null,           // { role, name, id }
   page: 'dashboard',
   auth: { mode: 'signin', step: 1, role: null, staffType: null, error: null, loading: false },
-  ask: { messages: [] },
+  ask: { messages: [], thinking: false, thinkingIndex: 0 },
+  bookingInFlight: false,
   booking: false,
   doctor: { selectedPatient: null },
   tpa: { selectedPatient: null },
   lab: { selectedPatient: null },
   uploadForPatient: { patientId: null },
-  admin: { selected: null, verified: false, selectedPatient: null },
+  admin: { selected: null, selectedPatient: null },
+  paidAdmissions: [],      // real, hospital-scoped, paid admissions — see ensurePaidAdmissions()
   sidebarOpen: false,
   documents: {},          // { [patientId]: Array<doc> } — populated by ensureDocuments()
   uploadStatus: {},        // { [contextKey]: {state, name, ...} } — upload progress/result
@@ -275,11 +277,10 @@ async function ensureDoctors() {
   _doctorsFetched = true;
   try {
     const res = await fetch(`${API_BASE}/doctors`);
-    const real = await res.json();
-    const seen = new Set(real.map(d => d.id));
-    state.doctors = [...real, ...MOCK.doctors.filter(d => !seen.has(d.id))];
+    state.doctors = await res.json();
   } catch (err) {
     // backend not running yet — keep the mock list so the UI still works
+    state.doctors = MOCK.doctors.slice();
   }
   render();
 }
@@ -349,6 +350,9 @@ function stopTicking() {
 }
 
 async function bookAppointment(patientId, doctorId, time, type) {
+  state.bookingInFlight = true;
+  state.bookingError = null;
+  render();
   try {
     await apiCall('/appointments', { patient_id: patientId, doctor_id: doctorId, time, type });
     state.booking = false;
@@ -356,8 +360,9 @@ async function bookAppointment(patientId, doctorId, time, type) {
     await refreshAppointments('patient', patientId);
   } catch (err) {
     state.bookingError = err.message;
-    render();
   }
+  state.bookingInFlight = false;
+  render();
 }
 
 async function setAppointmentStatus(appointmentId, status, doctorId) {
@@ -534,6 +539,19 @@ async function payAdmission(admissionId, appointmentId) {
   render();
 }
 
+let _paidAdmissionsFetched = false;
+async function ensurePaidAdmissions(hospital) {
+  if (_paidAdmissionsFetched) return;
+  _paidAdmissionsFetched = true;
+  try {
+    const res = await fetch(`${API_BASE}/admissions?hospital=${encodeURIComponent(hospital || '')}`);
+    state.paidAdmissions = await res.json();
+  } catch (err) {
+    state.paidAdmissions = [];
+  }
+  render();
+}
+
 let _needsReviewFetched = false;
 async function ensureNeedsReview(hospital) {
   if (_needsReviewFetched) return;
@@ -669,6 +687,9 @@ function nav(page) {
   _queuePositionRequested.clear(); // re-fetch fresh every time a queue page is entered
   state.queueError = null;
   _needsReviewFetched = false; // re-fetch fresh every time the review page is entered
+  _paidAdmissionsFetched = false; // re-fetch fresh every time the admin's intake pages are entered
+  _admissionFetchedFor.clear(); // re-fetch fresh — a hospital admin may have resolved something since
+  state.admission = null; // renderPatientAdmission() skips fetching once this is populated, so it must be cleared too
   state.redeemResult = null;
   state.redeemError = null;
   state.page = page;
@@ -702,6 +723,8 @@ function logout() {
   _apptsFetchedFor.clear();
   _admissionFetchedFor.clear();
   _needsReviewFetched = false;
+  _paidAdmissionsFetched = false;
+  state.paidAdmissions = [];
   _patientsFetched = false;
   _doctorsFetched = false;
   render();
@@ -1021,12 +1044,26 @@ function renderPatientUpload(myDocs, careTeamDocs) {
     </div>`;
 }
 
+const ASK_THINKING_WORDS = ['Thinking', 'Searching your records', 'Reviewing documents', 'Cross-checking sources'];
+let _askThinkingHandle = null;
+function _stopAskThinking() {
+  if (_askThinkingHandle) { clearInterval(_askThinkingHandle); _askThinkingHandle = null; }
+}
+
 async function sendAsk(presetText) {
+  if (state.ask.thinking) return; // a request is already in flight
   const inputEl = document.getElementById('ask-input');
   const text = presetText !== undefined ? presetText : (inputEl ? inputEl.value : '');
   if (!text || !text.trim()) return;
   state.ask.messages.push({ role: 'user', text });
   if (inputEl) inputEl.value = '';
+  state.ask.thinking = true;
+  state.ask.thinkingIndex = 0;
+  _stopAskThinking();
+  _askThinkingHandle = setInterval(() => {
+    state.ask.thinkingIndex = (state.ask.thinkingIndex + 1) % ASK_THINKING_WORDS.length;
+    render();
+  }, 1400);
   render();
 
   try {
@@ -1050,6 +1087,8 @@ async function sendAsk(presetText) {
       text: `Could not reach HeyDoc's RAG backend (${err.message}). Is server.py running with GEMINI_API_KEY set?`,
     });
   }
+  _stopAskThinking();
+  state.ask.thinking = false;
   render();
   const el = document.getElementById('ask-input');
   if (el) el.focus();
@@ -1077,6 +1116,10 @@ function renderAskHeyDoc() {
           ${m.role === 'assistant' && m.confidence !== undefined ? `<div style="font-size:11.5px;color:var(--ink500);margin-top:6px">Confidence: ${m.confidence}% · ${m.verified ? 'verified against records' : 'not fully verified'}</div>` : ''}
           ${m.role === 'assistant' ? aiNotice() : ''}
         </div>`).join('')}
+      ${state.ask.thinking ? `
+        <div class="chat-msg assistant">
+          <div class="chat-bubble assistant" style="color:var(--ink500);font-style:italic">${esc(ASK_THINKING_WORDS[state.ask.thinkingIndex])}…</div>
+        </div>` : ''}
     </div>`;
   }
   return `
@@ -1084,8 +1127,8 @@ function renderAskHeyDoc() {
     <div class="card chat-card">
       <div class="chat-body">${body}</div>
       <div class="chat-input-row">
-        <input class="input" id="ask-input" placeholder="Ask about your medical history..." onkeydown="askKeydown(event)">
-        <button class="btn btn-primary" onclick="sendAsk()">${icon('arrowRight', 15, '#fff')}</button>
+        <input class="input" id="ask-input" placeholder="Ask about your medical history..." onkeydown="askKeydown(event)" ${state.ask.thinking ? 'disabled' : ''}>
+        <button class="btn btn-primary" onclick="sendAsk()" ${state.ask.thinking ? 'disabled' : ''}>${icon('arrowRight', 15, '#fff')}</button>
       </div>
     </div>`;
 }
@@ -1093,6 +1136,7 @@ function renderAskHeyDoc() {
 function toggleBooking() { state.booking = !state.booking; state.bookingError = null; render(); }
 
 function confirmBooking() {
+  if (state.bookingInFlight) return; // already submitting — ignore extra clicks
   const doctorId = document.getElementById('book-doctor')?.value;
   const date = document.getElementById('book-date')?.value;
   const time = document.getElementById('book-time')?.value;
@@ -1126,7 +1170,7 @@ function renderPatientAppointments(appts) {
         <div class="field"><div class="field-label">Visit type</div>
           <select class="input" id="book-type"><option>OPD consultation</option><option>Hospital admission</option></select>
         </div>
-        <button class="btn btn-primary" onclick="confirmBooking()">Confirm booking</button>
+        <button class="btn btn-primary" onclick="confirmBooking()" ${state.bookingInFlight ? 'disabled' : ''}>${state.bookingInFlight ? 'Booking…' : 'Confirm booking'}</button>
       </div>` : ''}
 
     ${appts.length ? appts.map(a => {
@@ -1297,11 +1341,30 @@ const ADMISSION_SLOT_INFO = {
   employee_id: { label: 'Employee ID', hint: 'Required for corporate/group policies' },
 };
 
+const ADMISSION_DERIVED_CHECK_LABELS = {
+  identity_name_match: 'Name on ID matches patient',
+  insurance_policy_match: 'Policy number matches form',
+  diagnosis_match: 'Diagnosis match',
+};
+
 function admissionItemBadge(item) {
   if (!item) return badge('not started', 'var(--ink100)', 'var(--ink500)');
   if (item.status === 'verified') return badge('verified', 'var(--teal100)', 'var(--teal700)');
   if (item.status === 'needs_review') return badge('needs review', 'var(--amber100)', 'var(--amber600)');
   return badge('missing', 'var(--coral100)', 'var(--coral600)');
+}
+
+function derivedCheckCard(checklistByKey, itemKey, label) {
+  const item = checklistByKey[itemKey];
+  if (!item) return '';
+  return `
+    <div class="card mb-10">
+      <div class="flex-between">
+        <div style="font-weight:600;font-size:14px">${esc(label)}</div>
+        ${admissionItemBadge(item)}
+      </div>
+      ${item.explanation ? `<div style="font-size:12px;color:var(--ink500);margin-top:6px">${esc(item.explanation)}</div>` : ''}
+    </div>`;
 }
 
 function admissionSlotCard(adm, slot) {
@@ -1400,14 +1463,9 @@ function renderPatientAdmission(appt) {
     <div class="section-title">Required documents</div>
     ${docSlots.map(slot => admissionSlotCard(adm, slot)).join('')}
 
-    ${checklistByKey.diagnosis_match ? `
-      <div class="card mb-10">
-        <div class="flex-between">
-          <div style="font-weight:600;font-size:14px">Diagnosis match</div>
-          ${admissionItemBadge(checklistByKey.diagnosis_match)}
-        </div>
-        ${checklistByKey.diagnosis_match.explanation ? `<div style="font-size:12px;color:var(--ink500);margin-top:6px">${esc(checklistByKey.diagnosis_match.explanation)}</div>` : ''}
-      </div>` : ''}
+    ${derivedCheckCard(checklistByKey, 'identity_name_match', ADMISSION_DERIVED_CHECK_LABELS.identity_name_match)}
+    ${derivedCheckCard(checklistByKey, 'insurance_policy_match', ADMISSION_DERIVED_CHECK_LABELS.insurance_policy_match)}
+    ${derivedCheckCard(checklistByKey, 'diagnosis_match', ADMISSION_DERIVED_CHECK_LABELS.diagnosis_match)}
 
     <div class="card mt-8" style="text-align:center">
       ${anyNeedsReview ? `
@@ -1657,46 +1715,44 @@ function renderLabApp() {
 /* ============================================================
    Hospital admin
    ============================================================ */
-function openIntakeForm(apptId) {
-  state.admin.selected = MOCK.appointments.find(a => a.id === apptId);
-  state.admin.verified = false;
+function openIntakeForm(admissionId) {
+  state.admin.selected = state.paidAdmissions.find(a => a.id === admissionId) || null;
   state.page = 'intake';
   render();
 }
-function selectIntakeArrival(apptId) {
-  state.admin.selected = apptId ? MOCK.appointments.find(a => a.id === apptId) : null;
-  state.admin.verified = false;
+function selectIntakeArrival(admissionId) {
+  state.admin.selected = admissionId ? state.paidAdmissions.find(a => a.id === admissionId) : null;
   render();
 }
-function setVerified(checked) { state.admin.verified = checked; render(); }
 
-function intakeForm(appt) {
-  const p = MOCK.patients.find(pt => pt.id === appt.patientId);
-  const status = MOCK.deptStatus[appt.patientId] || { insurance: 'pending', labs: 'pending', documentation: 'pending' };
-  const verified = state.admin.verified;
+function intakeForm(adm) {
   return `
     <div class="card mb-16">
-      <div style="font-weight:700;font-size:15px;margin-bottom:14px">Cross-department status</div>
-      <div class="dept-status-row">
-        ${Object.entries(status).map(([dept, s]) => `
-          <div class="dept-status-cell">
-            <div class="dept-status-label">${esc(dept)}</div>
-            ${badge(s, (s === 'approved' || s === 'verified') ? 'var(--teal100)' : 'var(--amber100)', (s === 'approved' || s === 'verified') ? 'var(--teal700)' : 'var(--amber600)')}
-          </div>`).join('')}
-      </div>
+      <div style="font-weight:700;font-size:15px;margin-bottom:14px">Admission summary — ${esc(adm.patient_name)}</div>
+      <div class="field"><div class="field-label">Doctor</div><input class="input" value="${esc(adm.doctor_name)} — ${esc(adm.dept || '')}" disabled></div>
+      <div class="field"><div class="field-label">Admission date</div><input class="input" value="${esc(adm.admission_date || '')}" disabled></div>
+      <div class="field"><div class="field-label">Reason for admission</div><input class="input" value="${esc(adm.admission_reason || '')}" disabled></div>
+      <div class="field"><div class="field-label">Payment</div><input class="input" value="${adm.payment_path === 'insurance' ? 'Insurance / TPA cashless' : 'Self-pay'}" disabled></div>
+      ${adm.payment_path === 'insurance' ? `
+        <div class="field"><div class="field-label">Policy number</div><input class="input" value="${esc(adm.preauth.policy_number || '')}" disabled></div>
+        <div class="field"><div class="field-label">Sum insured</div><input class="input" value="₹${esc(adm.preauth.sum_insured || '')}" disabled></div>
+      ` : ''}
+    </div>
+    <div class="card mb-16">
+      <div style="font-weight:700;font-size:15px;margin-bottom:14px">Verification checklist</div>
+      ${adm.checklist.map(item => `
+        <div class="flex-between mb-10">
+          <div style="font-size:13.5px">${esc(ADMISSION_SLOT_INFO[item.item_key]?.label || ADMISSION_DERIVED_CHECK_LABELS[item.item_key] || item.item_key)}</div>
+          ${admissionItemBadge(item)}
+        </div>`).join('')}
+      <p style="font-size:11.5px;color:var(--ink500);margin-top:4px">This patient already completed two-tier verification and paid the advance before reaching this list — nothing here needs re-confirming.</p>
     </div>
     <div class="card">
-      <div style="font-weight:700;font-size:15px;margin-bottom:14px">Admission summary — ${esc(p?.name || '')}</div>
-      <div class="field"><div class="field-label">Allergies (from vault)</div><input class="input" value="Penicillin — noted in 2024 discharge summary"></div>
-      <div class="field"><div class="field-label">Current medications (from vault)</div><input class="input" value="Ceroxim-XP 625mg, Pantop 40mg"></div>
-      <div class="field"><div class="field-label">Insurance details</div><input class="input" value="Star Health — Policy #SH2024118832"></div>
-      <div class="field"><div class="field-label">Past diagnoses</div><input class="input" value="Recurrent dermoid cyst, nasal tip"></div>
-      <div class="verify-box">
-        <input type="checkbox" class="verify-checkbox" ${verified ? 'checked' : ''} onchange="setVerified(this.checked)">
-        <span>I have reviewed every field above against the source documents</span>
-      </div>
-      <button class="btn btn-primary mt-8" ${!verified ? 'disabled' : ''}>Verify and confirm admission</button>
-      <p style="font-size:11.5px;color:var(--ink500);margin-top:8px">Nothing is finalized automatically — this requires explicit human confirmation.</p>
+      <div style="font-weight:700;font-size:15px;margin-bottom:8px">Token</div>
+      <div style="font-size:22px;font-weight:700;letter-spacing:2px;color:var(--teal700)">${esc(adm.token || '')}</div>
+      ${adm.token_redeemed
+        ? `<div style="font-size:13px;color:var(--ink500);margin-top:6px">Redeemed — Ward ${esc(adm.ward || '')}, Bed ${esc(adm.bed_number || '')}</div>`
+        : `<div style="font-size:13px;color:var(--amber600);margin-top:6px">Not yet redeemed — use Admission verification to check the patient in.</div>`}
     </div>`;
 }
 
@@ -1712,7 +1768,8 @@ function renderAdminApp() {
     { key: 'upload', label: 'Upload for patient', icon: 'upload' },
     { key: 'admissionVerification', label: 'Admission verification', icon: 'shield' },
   ];
-  const admissions = MOCK.appointments.filter(a => a.type === 'admission' || a.type === 'new');
+  if (!_paidAdmissionsFetched) ensurePaidAdmissions(user.hospital);
+  const admissions = state.paidAdmissions;
 
   let content = '';
   if (state.page === 'dashboard') {
@@ -1720,31 +1777,28 @@ function renderAdminApp() {
       ${pageHeader('Front desk', 'Hospital intake automation — generate, verify, confirm.')}
       <div class="row mb-20">
         ${statCard('calendar', "Today's arrivals", admissions.length, '', 'var(--coral600)')}
-        ${statCard('clock', 'Pending verification', admissions.filter(a => a.intakeStatus === 'pending').length, '', 'var(--amber600)')}
+        ${statCard('clock', 'Awaiting check-in', admissions.filter(a => !a.token_redeemed).length, '', 'var(--amber600)')}
       </div>`;
   } else if (state.page === 'admissions') {
     content = `
-      ${pageHeader("Today's arrivals")}
-      ${admissions.map(a => {
-        const p = MOCK.patients.find(pt => pt.id === a.patientId);
-        return `
-          <div class="card mb-10 flex-between">
-            <div>
-              <div style="font-weight:600;font-size:14px">${esc(p?.name || '')}</div>
-              <div style="font-size:12.5px;color:var(--ink500)">${fmtTime(a.time)} · ${esc(a.type)}</div>
-            </div>
-            <button class="btn btn-secondary" onclick="openIntakeForm('${a.id}')">Open intake form</button>
-          </div>`;
-      }).join('')}`;
+      ${pageHeader("Today's arrivals", 'Patients who completed pre-admission verification and paid the advance.')}
+      ${admissions.length ? admissions.map(a => `
+        <div class="card mb-10 flex-between">
+          <div>
+            <div style="font-weight:600;font-size:14px">${esc(a.patient_name)}</div>
+            <div style="font-size:12.5px;color:var(--ink500)">${esc(a.doctor_name)} · ${esc(a.dept || '')} · ${esc(a.admission_date || '')}${a.token_redeemed ? ' · checked in' : ''}</div>
+          </div>
+          <button class="btn btn-secondary" onclick="openIntakeForm('${a.id}')">Open intake form</button>
+        </div>`).join('') : emptyState('calendar', 'No paid admissions yet', 'Patients show up here once they finish pre-admission verification and pay the advance.')}`;
   } else if (state.page === 'intake') {
     const selected = state.admin.selected;
     content = `
-      ${pageHeader('Intake form', "Pre-filled from the patient's vault. Review every field before confirming.")}
+      ${pageHeader('Intake form', "Pre-filled from the patient's real pre-admission verification — already checked, read-only.")}
       ${!selected ? `
         <div class="field"><div class="field-label">Select arrival</div>
           <select class="input" onchange="selectIntakeArrival(this.value)">
             <option value="">Choose a patient...</option>
-            ${admissions.map(a => `<option value="${a.id}">${esc(MOCK.patients.find(p => p.id === a.patientId)?.name || '')}</option>`).join('')}
+            ${admissions.map(a => `<option value="${a.id}">${esc(a.patient_name)}</option>`).join('')}
           </select>
         </div>` : intakeForm(selected)}`;
   } else if (state.page === 'lookup') {
@@ -1769,7 +1823,7 @@ function renderAdminApp() {
         <div class="card mb-10">
           <div class="flex-between mb-10">
             <div>
-              <div style="font-weight:600;font-size:14px">${esc(it.patient_name)} — ${esc(ADMISSION_SLOT_INFO[it.item_key]?.label || it.item_key)}</div>
+              <div style="font-weight:600;font-size:14px">${esc(it.patient_name)} — ${esc(ADMISSION_SLOT_INFO[it.item_key]?.label || ADMISSION_DERIVED_CHECK_LABELS[it.item_key] || it.item_key)}</div>
               <div style="font-size:12px;color:var(--ink500)">${esc(it.explanation || '')}</div>
             </div>
             ${badge('needs review', 'var(--amber100)', 'var(--amber600)')}
