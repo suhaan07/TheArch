@@ -1347,6 +1347,15 @@ const ADMISSION_DERIVED_CHECK_LABELS = {
   diagnosis_match: 'Diagnosis match',
 };
 
+// Derived checks that get folded into their upload slot's own card instead
+// of shown as a separate one -- a correctly-formatted ID with the wrong
+// name on it should read as one "not verified yet" status, not two
+// contradictory ones.
+const ADMISSION_LINKED_CHECKS = {
+  identity: 'identity_name_match',
+  insurance_policy: 'insurance_policy_match',
+};
+
 function admissionItemBadge(item) {
   if (!item) return badge('not started', 'var(--ink100)', 'var(--ink500)');
   if (item.status === 'verified') return badge('verified', 'var(--teal100)', 'var(--teal700)');
@@ -1367,10 +1376,15 @@ function derivedCheckCard(checklistByKey, itemKey, label) {
     </div>`;
 }
 
-function admissionSlotCard(adm, slot) {
+function admissionSlotCard(adm, slot, linkedCheckKey) {
   const info = ADMISSION_SLOT_INFO[slot];
   const item = adm.checklist.find(c => c.item_key === slot);
+  const linkedItem = linkedCheckKey ? adm.checklist.find(c => c.item_key === linkedCheckKey) : null;
   const status = state.admissionSlotStatus[slot];
+  // One uploaded document, one status: a correctly-formatted ID with the
+  // wrong name on it is not "verified" overall, even if the format check
+  // alone passed -- show whichever of the two checks is worse.
+  const overall = item && item.status !== 'verified' ? item : (linkedItem || item);
   return `
     <div class="card mb-10">
       <div class="flex-between mb-10">
@@ -1378,11 +1392,12 @@ function admissionSlotCard(adm, slot) {
           <div style="font-weight:600;font-size:14px">${esc(info.label)}</div>
           <div style="font-size:12px;color:var(--ink500)">${esc(info.hint)}</div>
         </div>
-        ${admissionItemBadge(item)}
+        ${admissionItemBadge(overall)}
       </div>
-      ${item && item.explanation ? `<div style="font-size:12px;color:var(--ink500);margin-bottom:10px">${esc(item.explanation)}</div>` : ''}
+      ${item && item.explanation ? `<div style="font-size:12px;color:var(--ink500);margin-bottom:4px">${esc(item.explanation)}</div>` : ''}
+      ${linkedItem && linkedItem.status !== 'verified' ? `<div style="font-size:12px;color:var(--coral600);margin-bottom:4px">${esc(linkedItem.explanation)}</div>` : ''}
       <input type="file" id="adm-file-${slot}" style="display:none" onchange="uploadAdmissionDocument('${adm.id}','${adm.appointment_id}','${slot}',this.files[0])">
-      <button class="btn btn-secondary" onclick="document.getElementById('adm-file-${slot}').click()">${item && item.status === 'verified' ? 'Replace file' : 'Select file'}</button>
+      <button class="btn btn-secondary mt-8" onclick="document.getElementById('adm-file-${slot}').click()">${overall && overall.status === 'verified' ? 'Replace file' : 'Select file'}</button>
       ${status ? uploadStatusHtml(status) : ''}
     </div>`;
 }
@@ -1461,10 +1476,8 @@ function renderPatientAdmission(appt) {
     </div>
 
     <div class="section-title">Required documents</div>
-    ${docSlots.map(slot => admissionSlotCard(adm, slot)).join('')}
+    ${docSlots.map(slot => admissionSlotCard(adm, slot, ADMISSION_LINKED_CHECKS[slot])).join('')}
 
-    ${derivedCheckCard(checklistByKey, 'identity_name_match', ADMISSION_DERIVED_CHECK_LABELS.identity_name_match)}
-    ${derivedCheckCard(checklistByKey, 'insurance_policy_match', ADMISSION_DERIVED_CHECK_LABELS.insurance_policy_match)}
     ${derivedCheckCard(checklistByKey, 'diagnosis_match', ADMISSION_DERIVED_CHECK_LABELS.diagnosis_match)}
 
     <div class="card mt-8" style="text-align:center">

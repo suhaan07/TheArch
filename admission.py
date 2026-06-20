@@ -224,13 +224,13 @@ def _run_diagnosis_match(admission: dict, documents: list[dict], gemini_model) -
 
 
 def _run_identity_name_match(admission: dict, documents: list[dict], gemini_model) -> ChecklistResult:
-    """Tier 1 first: a cheap word-overlap check confidently resolves the two
-    common cases -- every word of the registered name appears verbatim
-    (clear match) or none of them do at all (clear mismatch, e.g. a
-    different person's ID). Only genuinely ambiguous partial overlap (OCR
-    noise, name order, abbreviations) escalates to Tier 2 -- cuts Gemini
-    calls for the cases that don't need judgement, and means a real
-    mismatch is still caught even if the API is unavailable."""
+    """Tier 1 first: if every word of the registered name appears verbatim in
+    the extracted text, that's a confident match -- no LLM needed. Anything
+    less than a full match (partial OR zero overlap) escalates to Tier 2:
+    OCR on a real ID photo (rotated, skewed, glare) can fail to cleanly
+    extract the name region at all, so zero overlap does not reliably mean
+    "different person" -- only Gemini's broader reading of the actual text
+    can tell OCR noise apart from a genuine mismatch."""
     item_key = "identity_name_match"
     slot_docs = _docs_for_slot(documents, "identity")
     if not slot_docs:
@@ -242,11 +242,8 @@ def _run_identity_name_match(admission: dict, documents: list[dict], gemini_mode
 
     doc_text = slot_docs[0].get("text", "")
     name_words = _words(patient_name)
-    overlap = name_words & _words(doc_text)
-    if name_words and overlap == name_words:
+    if name_words and name_words <= _words(doc_text):
         return ChecklistResult(item_key, 1, "verified", slot_docs[0]["id"], "Name on the document matches the patient's registered name")
-    if name_words and not overlap:
-        return ChecklistResult(item_key, 1, "missing", slot_docs[0]["id"], f"The name on the document doesn't match the patient's registered name ({patient_name}).")
 
     prompt = (
         "You are checking whether a hospital admission identity document belongs to the patient being "

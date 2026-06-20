@@ -870,26 +870,20 @@ async def upload_admission_document(
             raise HTTPException(404, "admission not found")
     patient_id = adm["patient_id"]
 
-    models, imaging_models = get_rag_models()
+    models, _ = get_rag_models()
     dest_dir = ingestion.UPLOAD_DIR / patient_id
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest_path = dest_dir / file.filename
     with open(dest_path, "wb") as out:
         shutil.copyfileobj(file.file, out)
 
-    # Any image extension goes through Gemini Vision, not just filenames that
-    # happen to mention a modality (e.g. "IMG_2384.jpg", WhatsApp exports) --
-    # detect_modality() only picks which prompt to use; imaging.py already
-    # has a sensible generic-description fallback for "unknown_scan".
-    is_scan_image = dest_path.suffix.lower() in SCAN_IMAGE_EXTS
-    if is_scan_image:
-        result = imaging.ingest_scan(patient_id, dest_path, models, imaging_models)
-        pipeline = "imaging"
-        doc_type = "imaging_scan"
-    else:
-        result = ingestion.ingest_document(patient_id, dest_path, models)
-        pipeline = "ingestion"
-        doc_type = result.get("doc_type", "unknown")
+    # Admission slots (identity/medical_doc/insurance/etc.) are always photos
+    # of printed documents, never medical scans -- always run them through
+    # OCR, not the scan-description pipeline (which would just produce a
+    # "this isn't a medical image" refusal and lose the actual text).
+    result = ingestion.ingest_document(patient_id, dest_path, models)
+    pipeline = "ingestion"
+    doc_type = result.get("doc_type", "unknown")
 
     if result.get("status") != "ok":
         raise HTTPException(400, result.get("reason", "ingestion failed"))

@@ -169,6 +169,19 @@ def _extract_doctr(path: Path, ocr_model) -> tuple[str, float]:
     return text, avg_conf
 
 
+def _looks_like_garbage(text: str) -> bool:
+    """docTR can report high per-word confidence on individual misread
+    characters when a photo is rotated or skewed -- it's confidently reading
+    the wrong thing, not uncertain about the right thing, so the confidence
+    score alone doesn't catch it. Flag text where most "words" are 1-2
+    characters as suspect regardless of reported confidence."""
+    tokens = text.split()
+    if not tokens:
+        return True
+    short = sum(1 for t in tokens if len(t) <= 2)
+    return short / len(tokens) > 0.5
+
+
 def _extract_gemini_pdf(path: Path, gemini_client) -> str:
     """Rasterise each PDF page and send to Gemini Vision."""
     import fitz
@@ -289,13 +302,14 @@ def extract_text(path: Path, models: dict) -> tuple[str, str]:
         else:
             ocr_text, ocr_method = doctr_text, "doctr_fallback"
 
-    # docTR confident → use it
-    elif doctr_conf >= DOCTR_CONF_THRESHOLD:
+    # docTR confident and the output doesn't look like a garbled read → use it
+    elif doctr_conf >= DOCTR_CONF_THRESHOLD and not _looks_like_garbage(doctr_text):
         ocr_text, ocr_method = doctr_text, "doctr"
 
-    # Tier 2b — low confidence → escalate to Gemini
+    # Tier 2b — low confidence, or confidently garbled (e.g. a rotated photo) → escalate to Gemini
     else:
-        print(f"    [gemini]    {path.name}  (conf {doctr_conf:.3f} < {DOCTR_CONF_THRESHOLD})")
+        reason = f"conf {doctr_conf:.3f} < {DOCTR_CONF_THRESHOLD}" if doctr_conf < DOCTR_CONF_THRESHOLD else "output looks garbled"
+        print(f"    [gemini]    {path.name}  ({reason})")
         gemini_text = (
             _extract_gemini_image(path, models["gemini"]) if is_image
             else _extract_gemini_pdf(path, models["gemini"])
