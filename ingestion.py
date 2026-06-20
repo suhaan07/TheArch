@@ -352,6 +352,12 @@ DOC_TYPE_KEYWORDS: dict[str, list[str]] = {
         "insurance", "policy number", "claim", "tpa", "mediclaim",
         "pre-authorization", "cashless", "reimbursement",
     ],
+    "identity_proof": [
+        "aadhaar", "aadhar", "unique identification authority", "uidai",
+        "permanent account number", "income tax department", "election commission",
+        "voter id", "epic no", "passport no", "republic of india",
+        "government of india", "date of birth", "father's name",
+    ],
 }
 
 
@@ -360,6 +366,13 @@ def classify_document(text: str) -> str:
     scores = {dt: sum(tl.count(kw) for kw in kws) for dt, kws in DOC_TYPE_KEYWORDS.items()}
     best   = max(scores, key=scores.get)
     return best if scores[best] > 0 else "unknown"
+
+
+# ── ID-number patterns ──────────────────────────────────────────────────────
+# Reused by admission.py's Tier 1 checks (deterministic, no LLM needed) —
+# these are well-defined government ID formats, not fuzzy matching.
+_AADHAAR_PAT = re.compile(r"\b\d{4}\s?\d{4}\s?\d{4}\b")
+_PAN_PAT     = re.compile(r"\b[A-Z]{5}\d{4}[A-Z]\b")
 
 
 # ── Field Extraction ──────────────────────────────────────────────────────────
@@ -468,6 +481,7 @@ _DOC_TYPE_TO_SEMANTIC: dict[str, str] = {
     "imaging_report":    "lab_reports",
     "operative_notes":   "surgical_history",
     "insurance":         "patient_information",
+    "identity_proof":    "patient_information",
     "unknown":           "patient_information",
 }
 

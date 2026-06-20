@@ -38,6 +38,9 @@ python-dotenv
 # Image processing (doctr + Gemini Vision + imaging pipeline)
 Pillow
 
+# Admission token QR code (server-generated, no third-party QR API call)
+qrcode
+
 # Numerical
 numpy
 

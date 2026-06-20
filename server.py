@@ -12,8 +12,11 @@ is fast.
 Run with: uvicorn server:app --reload --port 8000
 Requires a .env file with GEMINI_API_KEY set.
 """
+import base64
 import datetime
 import hashlib
+import io
+import json
 import os
 import re
 import secrets
@@ -24,6 +27,8 @@ import threading
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
+
+import qrcode
 
 # ingestion/retrieval/advanced_rag/imaging print Unicode box-drawing characters
 # (─, •, ⚠) — Windows' default console codepage (cp1252) can't encode them and
@@ -41,6 +46,7 @@ import ingestion
 import retrieval
 import advanced_rag
 import imaging
+import admission as admission_engine
 
 load_dotenv()
 
@@ -59,6 +65,8 @@ DOC_TYPE_DEFAULT_SEMANTIC = {
     "operative_notes": "surgical_history",
     "insurance": "patient_information",
     "imaging_scan": "lab_reports",
+    "identity_proof": "patient_information",
+    "admission_intake": "patient_information",
     "unknown": "patient_information",
 }
 
@@ -148,6 +156,49 @@ def init_db():
             conn.execute("ALTER TABLE users ADD COLUMN queue_drift_minutes INTEGER NOT NULL DEFAULT 0")
         except sqlite3.OperationalError:
             pass
+        for col, coltype in (("admission_id", "TEXT"), ("slot", "TEXT")):
+            try:
+                conn.execute(f"ALTER TABLE documents ADD COLUMN {col} {coltype}")
+            except sqlite3.OperationalError:
+                pass
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS admissions (
+                id TEXT PRIMARY KEY,
+                appointment_id TEXT NOT NULL,
+                patient_id TEXT NOT NULL,
+                doctor_id TEXT NOT NULL,
+                admission_date TEXT,
+                admission_reason TEXT,
+                payment_path TEXT NOT NULL DEFAULT 'self_pay',
+                is_corporate INTEGER NOT NULL DEFAULT 0,
+                estimated_cost INTEGER,
+                preauth_json TEXT,
+                status TEXT NOT NULL DEFAULT 'in_progress',
+                token TEXT UNIQUE,
+                token_redeemed INTEGER NOT NULL DEFAULT 0,
+                ward TEXT,
+                bed_number TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS admission_checklist_items (
+                id TEXT PRIMARY KEY,
+                admission_id TEXT NOT NULL,
+                item_key TEXT NOT NULL,
+                tier INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                source_document_id TEXT,
+                explanation TEXT,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(admission_id, item_key)
+            )
+            """
+        )
 
 
 init_db()
@@ -541,6 +592,377 @@ def get_queue_position(appointment_id: str):
             "estimated_call_time": estimated_call_time.isoformat(),
             "drift_minutes": drift_minutes,
         }
+
+
+# ── Admission (pre-admission verification, payment, token) ────────────────────
+
+def _token_qr_data_uri(token: str) -> str:
+    """
+    Generate the token's QR code server-side (the well-tested `qrcode` library,
+    not a hand-rolled encoder, not a third-party QR API) and hand it to the
+    frontend as a ready-to-use data URI — no client-side encoding at all.
+    """
+    qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=8, border=2)
+    qr.add_data(token)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def admission_public(row: sqlite3.Row, conn: sqlite3.Connection) -> dict:
+    patient = conn.execute("SELECT name FROM users WHERE id = ?", (row["patient_id"],)).fetchone()
+    doctor = conn.execute("SELECT name, dept, room, hospital FROM users WHERE id = ?", (row["doctor_id"],)).fetchone()
+    items = conn.execute(
+        "SELECT * FROM admission_checklist_items WHERE admission_id = ? ORDER BY item_key", (row["id"],)
+    ).fetchall()
+    return {
+        "id": row["id"],
+        "appointment_id": row["appointment_id"],
+        "patient_id": row["patient_id"],
+        "patient_name": patient["name"] if patient else row["patient_id"],
+        "doctor_id": row["doctor_id"],
+        "doctor_name": doctor["name"] if doctor else row["doctor_id"],
+        "dept": doctor["dept"] if doctor else None,
+        "hospital": doctor["hospital"] if doctor else None,
+        "admission_date": row["admission_date"],
+        "admission_reason": row["admission_reason"],
+        "payment_path": row["payment_path"],
+        "is_corporate": bool(row["is_corporate"]),
+        "estimated_cost": row["estimated_cost"],
+        "preauth": json.loads(row["preauth_json"]) if row["preauth_json"] else {},
+        "status": row["status"],
+        "token": row["token"],
+        "qr_data_uri": _token_qr_data_uri(row["token"]) if row["token"] else None,
+        "token_redeemed": bool(row["token_redeemed"]),
+        "ward": row["ward"],
+        "bed_number": row["bed_number"],
+        "checklist": [
+            {
+                "item_key": it["item_key"],
+                "tier": it["tier"],
+                "status": it["status"],
+                "source_document_id": it["source_document_id"],
+                "explanation": it["explanation"],
+            }
+            for it in items
+        ],
+    }
+
+
+def _build_admission_documents(conn: sqlite3.Connection, collection, admission_id: str) -> list[dict]:
+    """Re-assemble each admission document's extracted text/diagnosis from
+    ChromaDB (already stored there by the normal ingestion pipeline) — no
+    separate text storage needed, just look it back up by patient_id+file_name."""
+    rows = conn.execute("SELECT * FROM documents WHERE admission_id = ?", (admission_id,)).fetchall()
+    out = []
+    for r in rows:
+        res = collection.get(
+            where={"$and": [{"patient_id": r["patient_id"]}, {"file_name": r["file_name"]}]},
+            include=["documents", "metadatas"],
+        )
+        texts = res.get("documents") or []
+        metas = res.get("metadatas") or []
+        diagnosis = next((m.get("diagnosis") for m in metas if m.get("diagnosis")), None)
+        out.append({
+            "id": r["id"],
+            "doc_type": r["doc_type"],
+            "slot": r["slot"],
+            "text": "\n".join(texts),
+            "diagnosis": diagnosis,
+        })
+    return out
+
+
+def _run_admission_verification(admission_id: str) -> list[dict]:
+    models, _ = get_rag_models()
+    with get_db() as conn:
+        adm_row = conn.execute("SELECT * FROM admissions WHERE id = ?", (admission_id,)).fetchone()
+        if not adm_row:
+            raise HTTPException(404, "admission not found")
+
+        documents = _build_admission_documents(conn, models["collection"], admission_id)
+        admission_dict = {
+            "payment_path": adm_row["payment_path"],
+            "is_corporate": bool(adm_row["is_corporate"]),
+            "estimated_cost": adm_row["estimated_cost"],
+            "admission_reason": adm_row["admission_reason"],
+            "preauth": json.loads(adm_row["preauth_json"]) if adm_row["preauth_json"] else {},
+        }
+        results = admission_engine.verify_admission(admission_dict, documents, models)
+
+        conn.execute("DELETE FROM admission_checklist_items WHERE admission_id = ?", (admission_id,))
+        now = datetime.datetime.now().isoformat()
+        for r in results:
+            conn.execute(
+                """
+                INSERT INTO admission_checklist_items
+                    (id, admission_id, item_key, tier, status, source_document_id, explanation, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (f"{admission_id}:{r.item_key}", admission_id, r.item_key, r.tier, r.status,
+                 r.source_document_id, r.explanation, now),
+            )
+
+        # Never regress a status that's already past payment just because
+        # verification re-ran (e.g. a late re-upload after the token was issued).
+        if adm_row["status"] in ("in_progress", "ready_for_payment"):
+            all_verified = bool(results) and all(r.status == "verified" for r in results)
+            conn.execute(
+                "UPDATE admissions SET status = ? WHERE id = ?",
+                ("ready_for_payment" if all_verified else "in_progress", admission_id),
+            )
+
+        return [
+            {"item_key": r.item_key, "tier": r.tier, "status": r.status,
+             "source_document_id": r.source_document_id, "explanation": r.explanation}
+            for r in results
+        ]
+
+
+class AdmissionCreateRequest(BaseModel):
+    appointment_id: str
+
+
+@app.post("/admissions")
+def create_admission(req: AdmissionCreateRequest):
+    with get_db() as conn:
+        appt = conn.execute("SELECT * FROM appointments WHERE id = ?", (req.appointment_id,)).fetchone()
+        if not appt:
+            raise HTTPException(404, "appointment not found")
+        existing = conn.execute(
+            "SELECT * FROM admissions WHERE appointment_id = ?", (req.appointment_id,)
+        ).fetchone()
+        if existing:
+            return admission_public(existing, conn)
+
+        admission_id = uuid.uuid4().hex[:12]
+        conn.execute(
+            "INSERT INTO admissions (id, appointment_id, patient_id, doctor_id, admission_date) VALUES (?, ?, ?, ?, ?)",
+            (admission_id, req.appointment_id, appt["patient_id"], appt["doctor_id"], appt["time"][:10]),
+        )
+
+    # Populate the checklist immediately (self_pay defaults to identity+medical_doc,
+    # both 'missing' with nothing uploaded yet) so the patient sees requirements
+    # right away instead of an empty list. Runs in its own connection — the INSERT
+    # above must be committed first (the outer `with` block already closed).
+    _run_admission_verification(admission_id)
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM admissions WHERE id = ?", (admission_id,)).fetchone()
+        return admission_public(row, conn)
+
+
+@app.get("/admissions/{admission_id}")
+def get_admission(admission_id: str):
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM admissions WHERE id = ?", (admission_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "admission not found")
+        return admission_public(row, conn)
+
+
+@app.get("/admissions")
+def list_admissions(appointment_id: str | None = None, status: str | None = None, hospital: str | None = None):
+    with get_db() as conn:
+        if appointment_id:
+            row = conn.execute("SELECT * FROM admissions WHERE appointment_id = ?", (appointment_id,)).fetchone()
+            return admission_public(row, conn) if row else None
+        if status == "needs_review" and hospital:
+            rows = conn.execute(
+                """
+                SELECT i.id as item_id, i.item_key, i.tier, i.status, i.source_document_id, i.explanation,
+                       a.id as admission_id, a.patient_id, a.doctor_id
+                FROM admission_checklist_items i
+                JOIN admissions a ON a.id = i.admission_id
+                JOIN users d ON d.id = a.doctor_id
+                WHERE i.status = 'needs_review' AND LOWER(d.hospital) = LOWER(?)
+                ORDER BY i.updated_at
+                """,
+                (hospital,),
+            ).fetchall()
+            out = []
+            for r in rows:
+                patient = conn.execute("SELECT name FROM users WHERE id = ?", (r["patient_id"],)).fetchone()
+                out.append({
+                    "item_id": r["item_id"], "item_key": r["item_key"], "tier": r["tier"],
+                    "status": r["status"], "source_document_id": r["source_document_id"],
+                    "explanation": r["explanation"], "admission_id": r["admission_id"],
+                    "patient_id": r["patient_id"], "patient_name": patient["name"] if patient else r["patient_id"],
+                })
+            return out
+        raise HTTPException(400, "pass either appointment_id, or status=needs_review&hospital=")
+
+
+class AdmissionUpdateRequest(BaseModel):
+    admission_date: str | None = None
+    admission_reason: str | None = None
+    payment_path: str | None = None
+    is_corporate: bool | None = None
+    estimated_cost: int | None = None
+    preauth: dict | None = None
+
+
+@app.put("/admissions/{admission_id}")
+def update_admission(admission_id: str, req: AdmissionUpdateRequest):
+    with get_db() as conn:
+        if not conn.execute("SELECT id FROM admissions WHERE id = ?", (admission_id,)).fetchone():
+            raise HTTPException(404, "admission not found")
+        fields, params = [], []
+        if req.admission_date is not None:
+            fields.append("admission_date = ?"); params.append(req.admission_date)
+        if req.admission_reason is not None:
+            fields.append("admission_reason = ?"); params.append(req.admission_reason)
+        if req.payment_path is not None:
+            if req.payment_path not in ("self_pay", "insurance"):
+                raise HTTPException(400, "payment_path must be 'self_pay' or 'insurance'")
+            fields.append("payment_path = ?"); params.append(req.payment_path)
+        if req.is_corporate is not None:
+            fields.append("is_corporate = ?"); params.append(int(req.is_corporate))
+        if req.estimated_cost is not None:
+            fields.append("estimated_cost = ?"); params.append(req.estimated_cost)
+        if req.preauth is not None:
+            fields.append("preauth_json = ?"); params.append(json.dumps(req.preauth))
+        if fields:
+            params.append(admission_id)
+            conn.execute(f"UPDATE admissions SET {', '.join(fields)} WHERE id = ?", params)
+
+    _run_admission_verification(admission_id)
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM admissions WHERE id = ?", (admission_id,)).fetchone()
+        return admission_public(row, conn)
+
+
+@app.post("/admissions/{admission_id}/documents")
+async def upload_admission_document(
+    admission_id: str,
+    slot: str = Form(...),
+    file: UploadFile = File(...),
+):
+    with get_db() as conn:
+        adm = conn.execute("SELECT * FROM admissions WHERE id = ?", (admission_id,)).fetchone()
+        if not adm:
+            raise HTTPException(404, "admission not found")
+    patient_id = adm["patient_id"]
+
+    models, imaging_models = get_rag_models()
+    dest_dir = ingestion.UPLOAD_DIR / patient_id
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_path = dest_dir / file.filename
+    with open(dest_path, "wb") as out:
+        shutil.copyfileobj(file.file, out)
+
+    is_scan_image = (
+        dest_path.suffix.lower() in SCAN_IMAGE_EXTS
+        and imaging.detect_modality(dest_path) != "unknown_scan"
+    )
+    if is_scan_image:
+        result = imaging.ingest_scan(patient_id, dest_path, models, imaging_models)
+        pipeline = "imaging"
+        doc_type = "imaging_scan"
+    else:
+        result = ingestion.ingest_document(patient_id, dest_path, models)
+        pipeline = "ingestion"
+        doc_type = result.get("doc_type", "unknown")
+
+    if result.get("status") != "ok":
+        raise HTTPException(400, result.get("reason", "ingestion failed"))
+
+    # Fallback UI label only — the real classifier's verdict (incl. "unknown")
+    # is still what Tier 1 checks against; this doesn't change chunk metadata.
+    display_doc_type = "admission_intake" if doc_type == "unknown" else doc_type
+    semantic_type = DOC_TYPE_DEFAULT_SEMANTIC.get(display_doc_type, "patient_information")
+
+    doc_id = uuid.uuid4().hex[:12]
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO documents (id, patient_id, uploaded_by, file_name, doc_type, semantic_type, pipeline, admission_id, slot)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (doc_id, patient_id, patient_id, dest_path.name, display_doc_type, semantic_type, pipeline, admission_id, slot),
+        )
+
+    checklist = _run_admission_verification(admission_id)
+    return {"document": {"id": doc_id, "doc_type": display_doc_type, "slot": slot}, "checklist": checklist}
+
+
+@app.post("/admissions/{admission_id}/payment")
+def pay_admission(admission_id: str):
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM admissions WHERE id = ?", (admission_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "admission not found")
+        items = conn.execute(
+            "SELECT status FROM admission_checklist_items WHERE admission_id = ?", (admission_id,)
+        ).fetchall()
+        if not items or any(it["status"] != "verified" for it in items):
+            raise HTTPException(400, "every checklist item must be verified before payment")
+
+        existing_tokens = {r["token"] for r in conn.execute("SELECT token FROM admissions WHERE token IS NOT NULL")}
+        token = admission_engine.generate_token(existing_tokens)
+        conn.execute(
+            "UPDATE admissions SET status = 'confirmed', token = ? WHERE id = ?",
+            (token, admission_id),
+        )
+        row = conn.execute("SELECT * FROM admissions WHERE id = ?", (admission_id,)).fetchone()
+        return admission_public(row, conn)
+
+
+class ChecklistResolveRequest(BaseModel):
+    status: str  # 'verified' | 'missing'
+    note: str | None = None
+
+
+@app.post("/admissions/checklist-items/{item_id}/resolve")
+def resolve_checklist_item(item_id: str, req: ChecklistResolveRequest):
+    if req.status not in ("verified", "missing"):
+        raise HTTPException(400, "status must be 'verified' or 'missing'")
+    with get_db() as conn:
+        item = conn.execute("SELECT * FROM admission_checklist_items WHERE id = ?", (item_id,)).fetchone()
+        if not item:
+            raise HTTPException(404, "checklist item not found")
+        conn.execute(
+            "UPDATE admission_checklist_items SET status = ?, explanation = ? WHERE id = ?",
+            (req.status, req.note or "Resolved by hospital admin", item_id),
+        )
+        admission_id = item["admission_id"]
+        adm_row = conn.execute("SELECT * FROM admissions WHERE id = ?", (admission_id,)).fetchone()
+        if adm_row["status"] in ("in_progress", "ready_for_payment"):
+            remaining = conn.execute(
+                "SELECT status FROM admission_checklist_items WHERE admission_id = ?", (admission_id,)
+            ).fetchall()
+            all_verified = bool(remaining) and all(r["status"] == "verified" for r in remaining)
+            conn.execute(
+                "UPDATE admissions SET status = ? WHERE id = ?",
+                ("ready_for_payment" if all_verified else "in_progress", admission_id),
+            )
+        row = conn.execute("SELECT * FROM admissions WHERE id = ?", (admission_id,)).fetchone()
+        return admission_public(row, conn)
+
+
+class RedeemRequest(BaseModel):
+    token: str
+    ward: str
+    bed_number: str
+
+
+@app.post("/admissions/redeem")
+def redeem_token(req: RedeemRequest):
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM admissions WHERE token = ?", (req.token.strip().upper(),)).fetchone()
+        if not row:
+            raise HTTPException(404, "no admission found for this token")
+        if row["token_redeemed"]:
+            raise HTTPException(409, "this token has already been redeemed")
+        if row["status"] != "confirmed":
+            raise HTTPException(400, f"admission is not ready for redemption (status: {row['status']})")
+        conn.execute(
+            "UPDATE admissions SET status = 'redeemed', token_redeemed = 1, ward = ?, bed_number = ? WHERE id = ?",
+            (req.ward, req.bed_number, row["id"]),
+        )
+        row = conn.execute("SELECT * FROM admissions WHERE id = ?", (row["id"],)).fetchone()
+        return admission_public(row, conn)
 
 
 # ── RAG pipeline (ingestion / imaging / retrieval / advanced_rag) ──────────────

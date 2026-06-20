@@ -192,6 +192,12 @@ const state = {
   queuePosition: null,     // { appointmentId, position, ahead_count, estimated_wait_minutes, is_current, estimated_call_time, drift_minutes }
   queueError: null,
   doctorDrift: null,       // minutes running behind (+) / ahead (-) schedule — null until ensureDoctorDrift() loads it
+  admission: null,         // current patient's admission record (full admission_public() shape) + checklist
+  admissionError: null,
+  admissionSlotStatus: {}, // { [slot]: {state:'uploading'|'error', message} } — per-slot upload feedback
+  needsReview: [],         // admin's flagged checklist items, hospital-scoped
+  redeemResult: null,
+  redeemError: null,
 };
 
 const CHECKIN_WINDOW_MINUTES = 30; // mirrors server.py's CHECKIN_WINDOW_MINUTES
@@ -440,6 +446,137 @@ async function adjustDrift(doctorId, delta) {
   render();
 }
 
+// ── Admission (pre-admission verification, payment, token) ────────────────
+const _admissionFetchedFor = new Set();
+
+async function ensureAdmission(appointmentId) {
+  if (_admissionFetchedFor.has(appointmentId)) return;
+  _admissionFetchedFor.add(appointmentId);
+  try {
+    const res = await fetch(`${API_BASE}/admissions?appointment_id=${encodeURIComponent(appointmentId)}`);
+    let data = await res.json();
+    if (!data) data = await apiCall('/admissions', { appointment_id: appointmentId });
+    state.admission = data;
+  } catch (err) {
+    state.admissionError = err.message;
+  }
+  render();
+}
+
+function refreshAdmission(appointmentId) {
+  _admissionFetchedFor.delete(appointmentId);
+  return ensureAdmission(appointmentId);
+}
+
+async function updateAdmission(admissionId, appointmentId, fields) {
+  state.admissionError = null;
+  try {
+    state.admission = await apiCall(`/admissions/${admissionId}`, fields, 'PUT');
+  } catch (err) {
+    state.admissionError = err.message;
+  }
+  render();
+}
+
+function setAdmissionPaymentPath(admissionId, appointmentId, path) {
+  updateAdmission(admissionId, appointmentId, { payment_path: path });
+}
+function setAdmissionCorporate(admissionId, appointmentId, checked) {
+  updateAdmission(admissionId, appointmentId, { is_corporate: checked });
+}
+
+function saveAdmissionDetails(admissionId, appointmentId) {
+  const path = state.admission.payment_path;
+  const fields = {
+    admission_date: document.getElementById('adm-date')?.value || null,
+    admission_reason: document.getElementById('adm-reason')?.value || null,
+  };
+  if (path === 'insurance') {
+    const cost = parseInt(document.getElementById('adm-cost')?.value, 10);
+    fields.estimated_cost = Number.isFinite(cost) ? cost : null;
+    fields.preauth = {
+      policy_number: document.getElementById('adm-policy')?.value || '',
+      sum_insured: document.getElementById('adm-sum-insured')?.value || '',
+      estimated_cost: document.getElementById('adm-cost')?.value || '',
+      diagnosis: document.getElementById('adm-preauth-diagnosis')?.value || '',
+      length_of_stay: document.getElementById('adm-los')?.value || '',
+      room_category: document.getElementById('adm-room-category')?.value || '',
+    };
+  }
+  updateAdmission(admissionId, appointmentId, fields);
+}
+
+async function uploadAdmissionDocument(admissionId, appointmentId, slot, file) {
+  const formData = new FormData();
+  formData.append('slot', slot);
+  formData.append('file', file);
+  state.admissionSlotStatus[slot] = { state: 'uploading', name: file.name };
+  render();
+  try {
+    const res = await fetch(`${API_BASE}/admissions/${admissionId}/documents`, { method: 'POST', body: formData });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Upload failed');
+    state.admissionSlotStatus[slot] = { state: 'done', name: file.name };
+    await refreshAdmission(appointmentId);
+  } catch (err) {
+    state.admissionSlotStatus[slot] = { state: 'error', name: file.name, message: err.message };
+    render();
+  }
+}
+
+async function payAdmission(admissionId, appointmentId) {
+  state.admissionError = null;
+  try {
+    state.admission = await apiCall(`/admissions/${admissionId}/payment`, {});
+  } catch (err) {
+    state.admissionError = err.message;
+  }
+  render();
+}
+
+let _needsReviewFetched = false;
+async function ensureNeedsReview(hospital) {
+  if (_needsReviewFetched) return;
+  _needsReviewFetched = true;
+  try {
+    const res = await fetch(`${API_BASE}/admissions?status=needs_review&hospital=${encodeURIComponent(hospital || '')}`);
+    state.needsReview = await res.json();
+  } catch (err) {
+    state.needsReview = [];
+  }
+  render();
+}
+
+async function resolveChecklistItem(itemId, status, hospital) {
+  try {
+    await apiCall(`/admissions/checklist-items/${itemId}/resolve`, { status });
+    _needsReviewFetched = false;
+    await ensureNeedsReview(hospital);
+  } catch (err) {
+    state.admissionError = err.message;
+    render();
+  }
+}
+
+async function redeemToken() {
+  state.redeemError = null;
+  state.redeemResult = null;
+  const token = document.getElementById('redeem-token')?.value.trim();
+  const ward = document.getElementById('redeem-ward')?.value.trim();
+  const bed = document.getElementById('redeem-bed')?.value.trim();
+  if (!token || !ward || !bed) {
+    state.redeemError = 'Enter the token, ward, and bed number.';
+    render();
+    return;
+  }
+  try {
+    state.redeemResult = await apiCall('/admissions/redeem', { token, ward, bed_number: bed });
+  } catch (err) {
+    state.redeemError = err.message;
+  }
+  render();
+}
+
 function uploadStatusHtml(status) {
   if (!status) return '';
   if (status.state === 'uploading') {
@@ -531,6 +668,9 @@ function nav(page) {
   stopTicking();
   _queuePositionRequested.clear(); // re-fetch fresh every time a queue page is entered
   state.queueError = null;
+  _needsReviewFetched = false; // re-fetch fresh every time the review page is entered
+  state.redeemResult = null;
+  state.redeemError = null;
   state.page = page;
   state.sidebarOpen = false;
   render();
@@ -552,8 +692,16 @@ function logout() {
   state.queuePosition = null;
   state.queueError = null;
   state.doctorDrift = null;
+  state.admission = null;
+  state.admissionError = null;
+  state.admissionSlotStatus = {};
+  state.needsReview = [];
+  state.redeemResult = null;
+  state.redeemError = null;
   _docsFetchedFor.clear();
   _apptsFetchedFor.clear();
+  _admissionFetchedFor.clear();
+  _needsReviewFetched = false;
   _patientsFetched = false;
   _doctorsFetched = false;
   render();
@@ -620,11 +768,11 @@ function quickSignin(r) {
   render();
 }
 
-async function apiCall(path, body) {
+async function apiCall(path, body, method = 'POST') {
   let res, data;
   try {
     res = await fetch(`${API_BASE}${path}`, {
-      method: 'POST',
+      method,
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
@@ -801,6 +949,8 @@ function renderPatientApp() {
     { key: 'appointments', label: 'Appointments', icon: 'calendar' },
     { key: 'queue', label: 'My queue', icon: 'clock' },
   ];
+  const admissionAppt = myAppts.find(a => a.type === 'admission');
+  if (admissionAppt) navItems.push({ key: 'admission', label: 'Admission', icon: 'shield' });
 
   let content = '';
   if (state.page === 'dashboard') content = renderPatientDashboard(docs, myAppts);
@@ -808,6 +958,7 @@ function renderPatientApp() {
   else if (state.page === 'ask') content = renderAskHeyDoc(user.id);
   else if (state.page === 'appointments') content = renderPatientAppointments(myAppts);
   else if (state.page === 'queue') content = renderPatientQueue(myAppts);
+  else if (state.page === 'admission') content = admissionAppt ? renderPatientAdmission(admissionAppt) : emptyState('shield', 'No admission scheduled');
 
   return shell('patient', user.name, navItems, state.page, content);
 }
@@ -1136,6 +1287,142 @@ function uploadForPatient(role) {
 }
 
 /* ============================================================
+   PATIENT — Admission (pre-admission verification, payment, token)
+   ============================================================ */
+const ADMISSION_SLOT_INFO = {
+  identity: { label: 'Identity proof', hint: 'Aadhaar, PAN, Voter ID, or passport' },
+  medical_doc: { label: 'Medical document', hint: "Doctor's prescription or admission letter stating the reason for hospitalization" },
+  insurance_policy: { label: 'Insurance policy', hint: 'Health insurance card or policy copy' },
+  kyc_pan: { label: 'KYC — PAN card', hint: 'Required since estimated cost is ₹1 lakh or more' },
+  employee_id: { label: 'Employee ID', hint: 'Required for corporate/group policies' },
+};
+
+function admissionItemBadge(item) {
+  if (!item) return badge('not started', 'var(--ink100)', 'var(--ink500)');
+  if (item.status === 'verified') return badge('verified', 'var(--teal100)', 'var(--teal700)');
+  if (item.status === 'needs_review') return badge('needs review', 'var(--amber100)', 'var(--amber600)');
+  return badge('missing', 'var(--coral100)', 'var(--coral600)');
+}
+
+function admissionSlotCard(adm, slot) {
+  const info = ADMISSION_SLOT_INFO[slot];
+  const item = adm.checklist.find(c => c.item_key === slot);
+  const status = state.admissionSlotStatus[slot];
+  return `
+    <div class="card mb-10">
+      <div class="flex-between mb-10">
+        <div>
+          <div style="font-weight:600;font-size:14px">${esc(info.label)}</div>
+          <div style="font-size:12px;color:var(--ink500)">${esc(info.hint)}</div>
+        </div>
+        ${admissionItemBadge(item)}
+      </div>
+      ${item && item.explanation ? `<div style="font-size:12px;color:var(--ink500);margin-bottom:10px">${esc(item.explanation)}</div>` : ''}
+      <input type="file" id="adm-file-${slot}" style="display:none" onchange="uploadAdmissionDocument('${adm.id}','${adm.appointment_id}','${slot}',this.files[0])">
+      <button class="btn btn-secondary" onclick="document.getElementById('adm-file-${slot}').click()">${item && item.status === 'verified' ? 'Replace file' : 'Select file'}</button>
+      ${status ? uploadStatusHtml(status) : ''}
+    </div>`;
+}
+
+function renderAdmissionToken(adm) {
+  const redeemed = adm.status === 'redeemed';
+  return `
+    ${pageHeader('Admission', redeemed ? "You're checked in!" : 'Your booking is confirmed.')}
+    <div class="card" style="text-align:center;padding:40px 20px">
+      ${redeemed ? `
+        <div style="font-weight:700;font-size:18px;color:var(--teal700);margin-bottom:6px">Checked in</div>
+        <div style="font-size:14px;color:var(--ink500)">Ward ${esc(adm.ward || '')} · Bed ${esc(adm.bed_number || '')}</div>
+      ` : `
+        <div style="font-size:13px;color:var(--ink500);margin-bottom:8px">Show this token at the hospital — no paperwork needed, you'll go straight to your bed.</div>
+        <div style="font-size:42px;font-weight:700;letter-spacing:4px;color:var(--teal700);margin:10px 0">${esc(adm.token)}</div>
+        ${adm.qr_data_uri ? `<img src="${adm.qr_data_uri}" alt="Admission token QR code" style="margin:14px auto;display:block;border-radius:8px">` : ''}
+      `}
+      <div style="margin-top:18px;font-size:13px;color:var(--ink500)">
+        ${esc(adm.doctor_name)} · ${esc(adm.dept || '')} · ${esc(adm.hospital || '')}<br>
+        Admission date: ${esc(adm.admission_date || '')}
+      </div>
+    </div>`;
+}
+
+function renderPatientAdmission(appt) {
+  if (!state.admission || state.admission.appointment_id !== appt.id) {
+    ensureAdmission(appt.id);
+    return `${pageHeader('Admission', 'Complete your pre-admission paperwork from home — no waiting at the hospital.')}<div class="card">${emptyState('shield', 'Loading…')}</div>`;
+  }
+  const adm = state.admission;
+  if (adm.status === 'confirmed' || adm.status === 'redeemed') return renderAdmissionToken(adm);
+
+  const path = adm.payment_path;
+  const checklistByKey = Object.fromEntries(adm.checklist.map(c => [c.item_key, c]));
+  const docSlots = ['identity', 'medical_doc'];
+  if (path === 'insurance') {
+    docSlots.push('insurance_policy');
+    if (checklistByKey.kyc_pan) docSlots.push('kyc_pan');
+    if (checklistByKey.employee_id) docSlots.push('employee_id');
+  }
+  const allVerified = adm.checklist.length > 0 && adm.checklist.every(c => c.status === 'verified');
+  const anyNeedsReview = adm.checklist.some(c => c.status === 'needs_review');
+
+  return `
+    ${pageHeader('Admission', 'Complete your pre-admission paperwork from home — no waiting at the hospital.')}
+    ${state.admissionError ? `<div class="auth-error mb-14">${esc(state.admissionError)}</div>` : ''}
+
+    <div class="card mb-20">
+      <div style="font-weight:700;font-size:15px;margin-bottom:14px">Admission details</div>
+      <div class="field"><div class="field-label">Admission date</div><input class="input" type="date" id="adm-date" value="${esc(adm.admission_date || '')}"></div>
+      <div class="field"><div class="field-label">Reason for admission</div><input class="input" id="adm-reason" placeholder="e.g. nose surgery for recurrent cyst" value="${esc(adm.admission_reason || '')}"></div>
+
+      <div class="field-label" style="margin-bottom:8px">How are you paying?</div>
+      <div class="auth-tabs" style="margin-bottom:16px">
+        <button class="auth-tab ${path === 'self_pay' ? 'active' : ''}" onclick="setAdmissionPaymentPath('${adm.id}','${adm.appointment_id}','self_pay')">Self-pay</button>
+        <button class="auth-tab ${path === 'insurance' ? 'active' : ''}" onclick="setAdmissionPaymentPath('${adm.id}','${adm.appointment_id}','insurance')">Insurance / TPA cashless</button>
+      </div>
+
+      ${path === 'insurance' ? `
+        <div class="flex-center-gap mb-14">
+          <input type="checkbox" id="adm-corporate" ${adm.is_corporate ? 'checked' : ''} onchange="setAdmissionCorporate('${adm.id}','${adm.appointment_id}',this.checked)">
+          <label for="adm-corporate" style="font-size:13px;color:var(--ink700)">This is a corporate/group policy</label>
+        </div>
+        <div class="field"><div class="field-label">Estimated treatment cost (₹)</div><input class="input" type="number" id="adm-cost" placeholder="e.g. 150000" value="${adm.estimated_cost ?? ''}"></div>
+        <div class="field"><div class="field-label">Policy number</div><input class="input" id="adm-policy" value="${esc(adm.preauth.policy_number || '')}"></div>
+        <div style="display:flex;gap:12px">
+          <div style="flex:1" class="field"><div class="field-label">Sum insured (₹)</div><input class="input" id="adm-sum-insured" value="${esc(adm.preauth.sum_insured || '')}"></div>
+          <div style="flex:1" class="field"><div class="field-label">Room category requested</div><input class="input" id="adm-room-category" value="${esc(adm.preauth.room_category || '')}"></div>
+        </div>
+        <div class="field"><div class="field-label">Diagnosis / reason for admission (for pre-authorization)</div><input class="input" id="adm-preauth-diagnosis" value="${esc(adm.preauth.diagnosis || '')}"></div>
+        <div class="field"><div class="field-label">Expected length of stay</div><input class="input" id="adm-los" placeholder="e.g. 2 days" value="${esc(adm.preauth.length_of_stay || '')}"></div>
+        ${checklistByKey.kyc_pan ? `<div class="ai-notice mb-14">${icon('shield', 15, 'var(--amber600)')}<span>Estimated cost is ₹1 lakh or more — a PAN card upload (KYC) is required.</span></div>` : ''}
+      ` : ''}
+
+      <button class="btn btn-primary" onclick="saveAdmissionDetails('${adm.id}','${adm.appointment_id}')">Save details</button>
+    </div>
+
+    <div class="section-title">Required documents</div>
+    ${docSlots.map(slot => admissionSlotCard(adm, slot)).join('')}
+
+    ${checklistByKey.diagnosis_match ? `
+      <div class="card mb-10">
+        <div class="flex-between">
+          <div style="font-weight:600;font-size:14px">Diagnosis match</div>
+          ${admissionItemBadge(checklistByKey.diagnosis_match)}
+        </div>
+        ${checklistByKey.diagnosis_match.explanation ? `<div style="font-size:12px;color:var(--ink500);margin-top:6px">${esc(checklistByKey.diagnosis_match.explanation)}</div>` : ''}
+      </div>` : ''}
+
+    <div class="card mt-8" style="text-align:center">
+      ${anyNeedsReview ? `
+        <div style="font-weight:600;color:var(--amber600);margin-bottom:10px">A hospital staff member is reviewing one of your documents — you'll be able to proceed once that's resolved.</div>
+        <button class="btn btn-primary btn-block" disabled>Proceed to payment</button>
+      ` : allVerified ? `
+        <button class="btn btn-primary btn-block" onclick="payAdmission('${adm.id}','${adm.appointment_id}')">Proceed to payment (₹500 advance — demo only)</button>
+      ` : `
+        <div style="font-size:13px;color:var(--ink500);margin-bottom:10px">Upload all required documents above to unlock payment.</div>
+        <button class="btn btn-primary btn-block" disabled>Proceed to payment</button>
+      `}
+    </div>`;
+}
+
+/* ============================================================
    DOCTOR
    ============================================================ */
 function setDoctorSelectedPatient(id) { state.doctor.selectedPatient = id; render(); }
@@ -1423,6 +1710,7 @@ function renderAdminApp() {
     { key: 'admissions', label: "Today's arrivals", icon: 'calendar' },
     { key: 'lookup', label: 'Patient lookup', icon: 'search' },
     { key: 'upload', label: 'Upload for patient', icon: 'upload' },
+    { key: 'admissionVerification', label: 'Admission verification', icon: 'shield' },
   ];
   const admissions = MOCK.appointments.filter(a => a.type === 'admission' || a.type === 'new');
 
@@ -1472,6 +1760,41 @@ function renderAdminApp() {
       ${selectedPatient ? vaultView(selectedPatient, false) : ''}`;
   } else if (state.page === 'upload') {
     content = `${pageHeader('Upload for patient', "Add a scan, report, or note directly to a patient's vault.")}${uploadForPatient('admin')}`;
+  } else if (state.page === 'admissionVerification') {
+    if (!_needsReviewFetched) ensureNeedsReview(user.hospital);
+    content = `
+      ${pageHeader('Admission verification', 'Items the rules-plus-AI checklist could not resolve on its own, plus token redemption at arrival.')}
+      <div class="section-title">Needs review</div>
+      ${state.needsReview.length ? state.needsReview.map(it => `
+        <div class="card mb-10">
+          <div class="flex-between mb-10">
+            <div>
+              <div style="font-weight:600;font-size:14px">${esc(it.patient_name)} — ${esc(ADMISSION_SLOT_INFO[it.item_key]?.label || it.item_key)}</div>
+              <div style="font-size:12px;color:var(--ink500)">${esc(it.explanation || '')}</div>
+            </div>
+            ${badge('needs review', 'var(--amber100)', 'var(--amber600)')}
+          </div>
+          <div style="display:flex;gap:8px">
+            <button class="btn btn-secondary" onclick="resolveChecklistItem('${it.item_id}','verified','${esc(user.hospital || '')}')">Mark verified</button>
+            <button class="btn btn-ghost" onclick="resolveChecklistItem('${it.item_id}','missing','${esc(user.hospital || '')}')">Mark missing</button>
+          </div>
+        </div>`).join('') : emptyState('check', 'Nothing needs review', "Items the checklist's rules and AI can't resolve on their own will show up here.")}
+
+      <div class="section-title" style="margin-top:24px">Redeem admission token</div>
+      <div class="card">
+        ${state.redeemError ? `<div class="auth-error">${esc(state.redeemError)}</div>` : ''}
+        <div class="field"><div class="field-label">Token</div><input class="input" id="redeem-token" placeholder="e.g. 3MC6UTFR" style="text-transform:uppercase"></div>
+        <div style="display:flex;gap:12px">
+          <div style="flex:1" class="field"><div class="field-label">Ward</div><input class="input" id="redeem-ward" placeholder="e.g. 3rd Floor ENT Ward"></div>
+          <div style="flex:1" class="field"><div class="field-label">Bed number</div><input class="input" id="redeem-bed" placeholder="e.g. B-12"></div>
+        </div>
+        <button class="btn btn-primary" onclick="redeemToken()">Redeem &amp; check in</button>
+        ${state.redeemResult ? `
+          <div class="dropzone-note compact" style="margin-top:14px">
+            ✓ ${esc(state.redeemResult.patient_name)} checked in — ${esc(state.redeemResult.doctor_name)} · ${esc(state.redeemResult.dept || '')} ·
+            Ward ${esc(state.redeemResult.ward)}, Bed ${esc(state.redeemResult.bed_number)}
+          </div>` : ''}
+      </div>`;
   }
 
   return shell('admin', user.name, navItems, state.page, content);
