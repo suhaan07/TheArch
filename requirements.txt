@@ -11,7 +11,11 @@ torchvision
 
 # Embeddings (ingestion + retrieval share same bge-large model)
 # Also used by CrossEncoder reranker (BAAI/bge-reranker-v2-m3)
-sentence-transformers
+# [onnx] extra (pulls in optimum+onnxruntime) backs the INT8-quantized
+# loading path used in production when THEARCH_QUANTIZED=1 — see
+# ingestion.py/retrieval.py. Local dev defaults to full-precision and never
+# imports onnxruntime, but Railway's build needs the extra present.
+sentence-transformers[onnx]
 
 # Vector store
 chromadb

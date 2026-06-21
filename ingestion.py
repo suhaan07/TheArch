@@ -37,6 +37,10 @@ DIGITAL_CHAR_THRESHOLD = 50
 CHUNK_SIZE             = 384
 CHUNK_OVERLAP          = 48
 EMBED_MODEL_NAME       = "BAAI/bge-large-en-v1.5"
+# INT8-quantized ONNX copy of the same model — used in production instead
+# (THEARCH_QUANTIZED=1) to fit Railway's memory limit. Same weights, lower
+# precision; `.encode()` behaves identically. Local dev never touches this.
+EMBED_MODEL_NAME_QUANTIZED = "suhaan7988/bge-large-en-v1.5-int8-onnx"
 EMBED_BATCH_SIZE       = 32
 CHROMA_COLLECTION      = "thearch_docs"
 
@@ -82,8 +86,15 @@ def init(gemini_api_key: str) -> dict:
     ocr_model = ocr_predictor(pretrained=True)
     print("  docTR OK")
 
-    print(f"Loading embedder ({EMBED_MODEL_NAME})...")
-    embedder = SentenceTransformer(EMBED_MODEL_NAME)
+    if os.environ.get("THEARCH_QUANTIZED") == "1":
+        print(f"Loading embedder, quantized ({EMBED_MODEL_NAME_QUANTIZED})...")
+        embedder = SentenceTransformer(
+            EMBED_MODEL_NAME_QUANTIZED, backend="onnx",
+            model_kwargs={"file_name": "onnx/model_int8.onnx"},
+        )
+    else:
+        print(f"Loading embedder ({EMBED_MODEL_NAME})...")
+        embedder = SentenceTransformer(EMBED_MODEL_NAME)
     print("  embedder OK")
 
     splitter = SentenceSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)

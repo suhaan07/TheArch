@@ -12,6 +12,7 @@ Usage:
     # models is the dict returned by ingestion.init(), extended in-place by init_reranker
 """
 
+import os
 import re
 import time
 import difflib
@@ -176,14 +177,27 @@ def _normalize_query(query: str) -> str:
 
 # ── Reranker ───────────────────────────────────────────────────────────────────
 
+RERANKER_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
+# INT8-quantized ONNX copy — see ingestion.EMBED_MODEL_NAME_QUANTIZED for the
+# same rationale (production-only, gated by THEARCH_QUANTIZED=1).
+RERANKER_MODEL_NAME_QUANTIZED = "suhaan7988/bge-reranker-v2-m3-int8-onnx"
+
+
 def init_reranker(models: dict) -> None:
     """
-    Load BAAI/bge-reranker-v2-m3 cross-encoder and store it in models["reranker"].
+    Load the bge-reranker-v2-m3 cross-encoder and store it in models["reranker"].
     Call once after ingestion.init(); models dict is extended in-place.
     """
     from sentence_transformers import CrossEncoder
-    print("Loading reranker (BAAI/bge-reranker-v2-m3)...")
-    models["reranker"] = CrossEncoder("BAAI/bge-reranker-v2-m3", max_length=512)
+    if os.environ.get("THEARCH_QUANTIZED") == "1":
+        print(f"Loading reranker, quantized ({RERANKER_MODEL_NAME_QUANTIZED})...")
+        models["reranker"] = CrossEncoder(
+            RERANKER_MODEL_NAME_QUANTIZED, backend="onnx",
+            model_kwargs={"file_name": "onnx/model_int8.onnx"}, max_length=512,
+        )
+    else:
+        print(f"Loading reranker ({RERANKER_MODEL_NAME})...")
+        models["reranker"] = CrossEncoder(RERANKER_MODEL_NAME, max_length=512)
     print("  reranker OK")
 
 
