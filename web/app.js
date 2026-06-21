@@ -54,7 +54,9 @@ const ROLE_LABEL = {
   patient: 'Patient', doctor: 'Doctor', tpa: 'TPA / insurance desk', lab: 'Lab / diagnostics', admin: 'Hospital admin',
 };
 
-const API_BASE = 'http://localhost:8000';
+const API_BASE = ['localhost', '127.0.0.1'].includes(window.location.hostname)
+  ? 'http://localhost:8000'
+  : 'https://backend-production-239e.up.railway.app';
 
 const ICON_PATHS = {
   grid: 'M3 3h7v7H3zM14 3h7v7h-7zM3 14h7v7H3zM14 14h7v7h-7z',
