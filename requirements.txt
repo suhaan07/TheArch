@@ -9,6 +9,12 @@ python-doctr[torch]
 torch
 torchvision
 
+# python-doctr pulls in opencv-python, which needs X11/GUI system libraries
+# (libxcb etc.) that headless server containers don't have — opencv-python-
+# headless is functionally identical (same `cv2` import) without that
+# requirement. Listed explicitly so it's the one installed.
+opencv-python-headless
+
 # Embeddings (ingestion + retrieval share same bge-large model)
 # Also used by CrossEncoder reranker (BAAI/bge-reranker-v2-m3)
 sentence-transformers
