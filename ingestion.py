@@ -244,6 +244,16 @@ def _extract_gemini_image(path: Path, gemini_client) -> str:
 
 
 def extract_text(path: Path, models: dict) -> tuple[str, str]:
+    """Thin wrapper around _extract_text_raw() that strips a leading UTF-8
+    BOM (\\ufeff) regardless of which extraction path produced it -- a BOM
+    character left in by a Windows-saved text file or some PDF generators
+    isn't valid ASCII, and Gemini's request transport chokes on it if it
+    ends up in a prompt untouched."""
+    text, method = _extract_text_raw(path, models)
+    return text.lstrip("﻿"), method
+
+
+def _extract_text_raw(path: Path, models: dict) -> tuple[str, str]:
     """
     Hybrid OCR pipeline:
 
@@ -267,7 +277,7 @@ def extract_text(path: Path, models: dict) -> tuple[str, str]:
     # Tier 0
     if path.suffix.lower() in {".txt", ".md", ".text"}:
         print(f"    [plaintext] {path.name}")
-        return path.read_text(errors="replace"), "plaintext"
+        return path.read_text(encoding="utf-8-sig", errors="replace"), "plaintext"
 
     # Tier 1
     pymupdf_text = None
