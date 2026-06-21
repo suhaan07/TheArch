@@ -25,9 +25,6 @@ rank_bm25
 # Gemini API (new SDK — google-genai, NOT google-generativeai)
 google-genai
 
-# UI
-streamlit
-
 # Auth API (server.py) backing the web/ frontend
 fastapi
 uvicorn[standard]
@@ -44,6 +41,7 @@ qrcode
 # Numerical
 numpy
 
-# Imaging pipeline — BioViL-T chest X-ray secondary check (optional)
-# If install fails or is skipped, the pipeline falls back to Gemini Vision only
-hi-ml-multimodal
+# Imaging pipeline — BioViL-T chest X-ray secondary check (optional, not
+# currently installed even in local dev — imaging.py already falls back to
+# Gemini Vision only if it's absent). Install manually if you want it:
+#   pip install hi-ml-multimodal
