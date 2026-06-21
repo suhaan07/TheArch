@@ -385,8 +385,10 @@ def classify_document(text: str) -> str:
 # ── ID-number patterns ──────────────────────────────────────────────────────
 # Reused by admission.py's Tier 1 checks (deterministic, no LLM needed) —
 # these are well-defined government ID formats, not fuzzy matching.
-_AADHAAR_PAT = re.compile(r"\b\d{4}\s?\d{4}\s?\d{4}\b")
-_PAN_PAT     = re.compile(r"\b[A-Z]{5}\d{4}[A-Z]\b")
+_AADHAAR_PAT  = re.compile(r"\b\d{4}\s?\d{4}\s?\d{4}\b")
+_PAN_PAT      = re.compile(r"\b[A-Z]{5}\d{4}[A-Z]\b")
+_EPIC_PAT     = re.compile(r"\b[A-Z]{3}\d{7}\b")              # Voter ID (EPIC)
+_PASSPORT_PAT = re.compile(r"\b[A-Z][1-9]\d{5}[1-9]\b")       # Indian passport
 
 
 # ── Field Extraction ──────────────────────────────────────────────────────────

@@ -30,7 +30,10 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-from ingestion import _AADHAAR_PAT, _PAN_PAT
+from ingestion import _AADHAAR_PAT, _PAN_PAT, _EPIC_PAT, _PASSPORT_PAT
+from id_validators import (
+    aadhaar_valid, pan_holder_type_valid, insurance_structure_score, DOCTOR_REG_NO_PAT,
+)
 
 GEMINI_MODEL = "gemini-2.5-flash-lite"
 _RETRYABLE_TAGS = ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "overloaded")
@@ -113,18 +116,49 @@ def run_tier1(item_key: str, admission: dict, documents: list[dict]) -> Checklis
             return ChecklistResult(item_key, 1, "missing", explanation="No identity document uploaded yet")
         d = slot_docs[0]
         text = d.get("text", "")
-        if _AADHAAR_PAT.search(text) or _PAN_PAT.search(text):
-            # An actual ID number pattern is present -- confident, no LLM needed.
+
+        aadhaar_match = _AADHAAR_PAT.search(text)
+        if aadhaar_match:
+            if aadhaar_valid(aadhaar_match.group()):
+                return ChecklistResult(item_key, 1, "verified", d["id"], "Identity document recognized (Aadhaar checksum valid)")
+            # Format matched but the number itself fails the Verhoeff checksum
+            # -- could be an OCR digit error, could be made up. Not a flat
+            # reject: escalate with that specific reason as context.
+            return ChecklistResult(item_key, 1, "missing", d["id"],
+                                    "Aadhaar number format matched but failed the standard Verhoeff checksum validation — could be an OCR digit error or a fabricated number.")
+
+        pan_match = _PAN_PAT.search(text)
+        if pan_match:
+            if pan_holder_type_valid(pan_match.group()):
+                return ChecklistResult(item_key, 1, "verified", d["id"], "Identity document recognized (PAN format valid)")
+            return ChecklistResult(item_key, 1, "missing", d["id"],
+                                    "PAN format matched but the entity-type character (4th letter) is not a valid PAN holder type — could be an OCR error or a fabricated number.")
+
+        if _EPIC_PAT.search(text) or _PASSPORT_PAT.search(text):
+            # No public checksum exists for these to verify against, but the
+            # format is genuinely present -- still better than no check at all.
             return ChecklistResult(item_key, 1, "verified", d["id"], "Identity document recognized")
+
         # doc_type == "identity_proof" alone is just keyword scoring (e.g. "date
         # of birth", "father's name" appearing anywhere) -- it proves the page
-        # is ID-shaped, not that it has a real ID number on it. A passport/voter
-        # ID (different number format) and a blank page with ID-sounding words
-        # both land here; escalate either way rather than trusting the label.
-        return ChecklistResult(item_key, 1, "missing", d["id"], text)
+        # is ID-shaped, not that it has a real ID number on it. Escalate
+        # rather than trusting the label.
+        return ChecklistResult(item_key, 1, "missing", d["id"], "No recognized ID number format (Aadhaar/PAN/Voter ID/passport) found in the document.")
 
     if item_key == "medical_doc":
-        return _tier1_doc_type_check(item_key, "medical_doc", MEDICAL_DOC_TYPES, documents)
+        result = _tier1_doc_type_check(item_key, "medical_doc", MEDICAL_DOC_TYPES, documents)
+        if result.status == "verified":
+            doc = next((d for d in documents if d.get("id") == result.source_document_id), None)
+            text = doc.get("text", "") if doc else ""
+            if DOCTOR_REG_NO_PAT.search(text):
+                return ChecklistResult(item_key, 1, "verified", result.source_document_id, f"{result.explanation} — doctor registration number present")
+            # NMC mandates every prescription carry the doctor's registration
+            # number; its total absence is a real, recognized red flag, but
+            # not a flat reject -- escalate rather than auto-verify on
+            # classification alone.
+            return ChecklistResult(item_key, 1, "missing", result.source_document_id,
+                                    f"{result.explanation}, but no doctor registration number was found anywhere in the document — Indian medical regulations require this on every prescription.")
+        return result
 
     if item_key == "insurance_policy":
         return _tier1_doc_type_check(item_key, "insurance_policy", {"insurance"}, documents)
@@ -265,11 +299,14 @@ def _run_identity_name_match(admission: dict, documents: list[dict], gemini_mode
 
 def _run_insurance_policy_match(admission: dict, documents: list[dict], gemini_model) -> ChecklistResult:
     """Tier 1 first: does the policy number typed into the pre-auth form
-    appear verbatim in the uploaded document? A doc_type classification of
+    appear verbatim in the uploaded document, AND does the document carry
+    the structure a genuine policy doc/cashless card has (insurer name,
+    "sum insured", TPA/IRDAI mention)? A doc_type classification of
     'insurance' alone (e.g. the word "insurance" appearing anywhere) proves
-    nothing about whether it's a real, matching policy -- this is the actual
-    content check. Only escalates to Tier 2 if the literal match fails,
-    since OCR noise on a policy number is plausible but shouldn't be
+    nothing about whether it's a real, matching policy -- and neither does
+    the policy number alone, since a fake page could just contain that one
+    string with nothing else a real document has. Escalates to Tier 2 if
+    either check falls short, since OCR noise is plausible but shouldn't be
     silently treated the same as a flatly fabricated document."""
     item_key = "insurance_policy_match"
     insurance_docs = [d for d in _docs_for_slot(documents, "insurance_policy") if d.get("doc_type") == "insurance"]
@@ -282,17 +319,27 @@ def _run_insurance_policy_match(admission: dict, documents: list[dict], gemini_m
         return ChecklistResult(item_key, 1, "missing", doc["id"], "Enter your policy number in the pre-authorization form so it can be cross-checked against the document")
 
     text = doc.get("text", "")
-    if policy_number.lower() in text.lower():
+    number_matches = policy_number.lower() in text.lower()
+    if number_matches and insurance_structure_score(text) >= 1:
         return ChecklistResult(item_key, 1, "verified", doc["id"], "Policy number on the document matches the form")
+
+    if number_matches:
+        # The number matches, but the document otherwise lacks anything a
+        # genuine policy document/cashless card normally has (insurer name,
+        # sum insured, TPA/IRDAI mention) -- don't auto-verify on the string
+        # match alone, but don't flatly reject either (could just be a
+        # cropped photo). Let Gemini judge with that context.
+        situation = "The policy number entered on the form was found verbatim in the document, but the document otherwise has none of the structure a real policy document/cashless card normally carries (no insurer name, no \"sum insured\", no TPA/IRDAI mention)."
+    else:
+        situation = "The exact policy number string was not found verbatim in the document text -- this could be OCR noise, spacing/formatting differences, or a genuinely different or fabricated policy."
 
     prompt = (
         "You are checking a hospital admission insurance document for consistency with the form the "
         "patient filled in -- not making a coverage decision.\n\n"
         f"POLICY NUMBER ENTERED ON THE FORM:\n{policy_number}\n\n"
         f"TEXT EXTRACTED FROM THE UPLOADED DOCUMENT:\n{text[:1000]}\n\n"
-        "The exact policy number string was not found verbatim in the document text -- this could be OCR "
-        "noise, spacing/formatting differences, or a genuinely different or fabricated policy. Does the "
-        "document plausibly belong to the same policy entered on the form?\n\n"
+        f"{situation} Does the document plausibly belong to the same policy entered on the form, and does "
+        "it look like a genuine policy document overall?\n\n"
         'Respond in this exact JSON format (no markdown fences):\n'
         '{"verdict": "verified" or "missing" or "uncertain", "explanation": "one sentence, in plain '
         'language the patient can act on if not verified"}\n'
@@ -339,11 +386,14 @@ def verify_admission(admission: dict, documents: list[dict], models: dict) -> li
         r = run_tier1(item_key, admission, documents)
         if r.status == "missing" and r.source_document_id and item_key != "preauth_form":
             # A document exists for this slot but Tier 1 couldn't confirm it —
-            # ambiguous, escalate. Pass the doc's text through via .explanation
-            # so the Tier 2 call doesn't need to re-look-up the document.
+            # ambiguous, escalate. Whatever specific reason run_tier1 already
+            # identified (e.g. a failed checksum) is kept as a hint ahead of
+            # the raw text, so Gemini isn't judging blind.
             doc = next((d for d in documents if d.get("id") == r.source_document_id), None)
             if doc is not None:
-                r = ChecklistResult(item_key, 1, "missing", r.source_document_id, doc.get("text", ""))
+                doc_text = doc.get("text", "")
+                context = f"{r.explanation}\n\nDOCUMENT TEXT:\n{doc_text}" if r.explanation else doc_text
+                r = ChecklistResult(item_key, 1, "missing", r.source_document_id, context)
                 r = _run_escalation(item_key, r, models["gemini"])
         results.append(r)
 
