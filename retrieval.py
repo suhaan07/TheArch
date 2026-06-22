@@ -36,7 +36,7 @@ SYSTEM_PROMPT = (
     "When citing a fact, mention which document it came from (file name and document type)."
 )
 
-GEMINI_MODEL = "gemini-2.5-flash-lite"
+GEMINI_MODEL = "gemini-3.1-flash-lite"
 
 # ── Query normalisation ────────────────────────────────────────────────────────
 # Applied before both vector encoding and BM25 tokenisation so the expanded,

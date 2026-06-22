@@ -35,7 +35,7 @@ from id_validators import (
     aadhaar_valid, pan_holder_type_valid, insurance_structure_score, DOCTOR_REG_NO_PAT,
 )
 
-GEMINI_MODEL = "gemini-2.5-flash-lite"
+GEMINI_MODEL = "gemini-3.1-flash-lite"
 _RETRYABLE_TAGS = ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "overloaded")
 _RETRY_DELAYS = (5, 15, 30)
 
