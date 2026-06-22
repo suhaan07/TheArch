@@ -1118,6 +1118,42 @@ def chat(req: ChatRequest):
     }
 
 
+# TEMPORARY diagnostic route — dumps non-ASCII characters found anywhere in
+# a chunk's text or metadata for a given file_name, to locate exactly where
+# a '﻿' BOM (or similar) is hiding. Remove after debugging.
+@app.get("/_admin/inspect_chunk")
+def _admin_inspect_chunk(token: str, file_name: str):
+    if token != "MUiC7bwz9G8MTRllS3BMjRebfjGlS5Vh":
+        raise HTTPException(status_code=403, detail="forbidden")
+    import chromadb
+    from chromadb.config import Settings
+    client = chromadb.PersistentClient(
+        path=str(ingestion.CHROMA_DIR),
+        settings=Settings(anonymized_telemetry=False),
+    )
+    coll = client.get_or_create_collection(
+        name=ingestion.CHROMA_COLLECTION,
+        metadata={"hnsw:space": "cosine"},
+    )
+    res = coll.get(where={"file_name": file_name}, include=["documents", "metadatas"])
+    out = []
+    for doc_id, doc, meta in zip(res["ids"], res["documents"], res["metadatas"]):
+        non_ascii_in_doc = [{"pos": i, "char": repr(c), "code": hex(ord(c))} for i, c in enumerate(doc or "") if ord(c) > 127]
+        meta_issues = {}
+        for k, v in meta.items():
+            if isinstance(v, str):
+                bad = [{"pos": i, "char": repr(c), "code": hex(ord(c))} for i, c in enumerate(v) if ord(c) > 127]
+                if bad:
+                    meta_issues[k] = {"value_repr": repr(v), "non_ascii": bad}
+        out.append({
+            "id": doc_id,
+            "doc_non_ascii": non_ascii_in_doc[:10],
+            "doc_len": len(doc or ""),
+            "meta_issues": meta_issues,
+        })
+    return {"matches": len(res["ids"]), "details": out}
+
+
 # TEMPORARY one-off maintenance route — strips a leading UTF-8 BOM from any
 # already-ingested ChromaDB chunk (older uploads predate the BOM-stripping
 # fix in ingestion.extract_text). Remove after running once in production.
