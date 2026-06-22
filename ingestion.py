@@ -81,6 +81,7 @@ def init(gemini_api_key: str) -> dict:
     import chromadb
     from chromadb.config import Settings
     import google.genai as genai
+    from google.genai import types as genai_types
 
     print("Loading docTR...")
     ocr_model = ocr_predictor(pretrained=True)
@@ -109,7 +110,16 @@ def init(gemini_api_key: str) -> dict:
     )
     print(f"  ChromaDB ready — {collection.count()} existing chunks")
 
-    gemini_client = genai.Client(api_key=gemini_api_key)
+    # http2=False: seen in production (not locally, where h2 isn't installed)
+    # a long-lived HTTP/2 connection occasionally desyncs its header
+    # compression state, causing later requests to read back a garbled,
+    # BOM-prefixed cached header value from an unrelated earlier response --
+    # httpx then fails trying to ascii-encode it on the next request. HTTP/1.1
+    # has no shared compression state between requests, so this can't happen.
+    gemini_client = genai.Client(
+        api_key=gemini_api_key,
+        http_options=genai_types.HttpOptions(client_args={"http2": False}),
+    )
     print("  Gemini client ready")
 
     return {
