@@ -1116,3 +1116,25 @@ def chat(req: ChatRequest):
         "verified": result["verified"],
         "route": result["route"],
     }
+
+
+# TEMPORARY diagnostic route — captures the FULL traceback (not just repr(e))
+# of the ascii-encode failure, to find exactly which line/library raises it.
+# The earlier http2=False fix didn't resolve the live issue, so the prior
+# HTTP/2-desync theory needs re-checking against the real call stack.
+# Remove after debugging.
+@app.get("/_admin/gemini_traceback")
+def _admin_gemini_traceback(token: str):
+    if token != "MUiC7bwz9G8MTRllS3BMjRebfjGlS5Vh":
+        raise HTTPException(status_code=403, detail="forbidden")
+    import traceback
+    models, _ = get_rag_models()
+    prompt = "﻿Hello there, what medications am I on? please answer based on context."
+    try:
+        resp = models["gemini"].models.generate_content(
+            model=retrieval.GEMINI_MODEL,
+            contents=[{"parts": [{"text": prompt}]}],
+        )
+        return {"status": "OK", "response": resp.text[:200]}
+    except Exception:
+        return {"status": "FAILED", "traceback": traceback.format_exc()}
