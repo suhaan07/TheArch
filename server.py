@@ -1118,6 +1118,31 @@ def chat(req: ChatRequest):
     }
 
 
+# TEMPORARY diagnostic route — calls Gemini directly with a BOM embedded in
+# the prompt, from inside the actual deployed environment, to check whether
+# this container's dependency versions/locale reproduce the ascii-encode
+# error that doesn't reproduce locally. Remove after debugging.
+@app.get("/_admin/test_gemini_bom")
+def _admin_test_gemini_bom(token: str):
+    if token != "MUiC7bwz9G8MTRllS3BMjRebfjGlS5Vh":
+        raise HTTPException(status_code=403, detail="forbidden")
+    import sys
+    models, _ = get_rag_models()
+    prompt = "﻿Hello there, what medications am I on? please answer based on context."
+    out = {"python_version": sys.version, "stdout_encoding": sys.stdout.encoding}
+    try:
+        resp = models["gemini"].models.generate_content(
+            model=retrieval.GEMINI_MODEL,
+            contents=[{"parts": [{"text": prompt}]}],
+        )
+        out["status"] = "OK"
+        out["response"] = resp.text[:200]
+    except Exception as e:
+        out["status"] = "FAILED"
+        out["error"] = repr(e)
+    return out
+
+
 # TEMPORARY diagnostic route — dumps non-ASCII characters found anywhere in
 # a chunk's text or metadata for a given file_name, to locate exactly where
 # a '﻿' BOM (or similar) is hiding. Remove after debugging.
