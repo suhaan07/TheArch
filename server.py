@@ -1116,3 +1116,32 @@ def chat(req: ChatRequest):
         "verified": result["verified"],
         "route": result["route"],
     }
+
+
+# TEMPORARY one-off maintenance route — strips a leading UTF-8 BOM from any
+# already-ingested ChromaDB chunk (older uploads predate the BOM-stripping
+# fix in ingestion.extract_text). Remove after running once in production.
+@app.post("/_admin/strip_bom_chunks")
+def _admin_strip_bom_chunks(token: str):
+    if token != "MUiC7bwz9G8MTRllS3BMjRebfjGlS5Vh":
+        raise HTTPException(status_code=403, detail="forbidden")
+    import chromadb
+    from chromadb.config import Settings
+    client = chromadb.PersistentClient(
+        path=str(ingestion.CHROMA_DIR),
+        settings=Settings(anonymized_telemetry=False),
+    )
+    coll = client.get_or_create_collection(
+        name=ingestion.CHROMA_COLLECTION,
+        metadata={"hnsw:space": "cosine"},
+    )
+    res = coll.get(include=["documents", "embeddings"])
+    fixed = []
+    for doc_id, doc, emb in zip(res["ids"], res["documents"], res["embeddings"]):
+        if doc and doc.startswith("﻿"):
+            # Pass the existing embedding back unchanged -- without it, update()
+            # re-embeds with chromadb's default model (384-dim), which doesn't
+            # match the bge-large embeddings (1024-dim) actually stored here.
+            coll.update(ids=[doc_id], documents=[doc.lstrip("﻿")], embeddings=[emb])
+            fixed.append(doc_id)
+    return {"total_chunks": len(res["ids"]), "fixed_ids": fixed}
